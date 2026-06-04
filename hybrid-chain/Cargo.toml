@@ -1,0 +1,22 @@
+[package]
+name = "hybrid-chain"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hybrid-node"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+log = "0.4"
+env_logger = "0.11"
+bincode = "1"
+
+[dev-dependencies]
+criteria = "0.5"
