@@ -1,44 +1,46 @@
-//! The `tpu` module implements the Transaction Processing Unit, a
-//! multi-stage transaction processing pipeline in software.
+//! Transaction Processing Unit — modified for hybrid PoW/PoS consensus.
+//! PohRecorder references have been replaced with BlockRecorder.
+//! Leader-schedule and vote-listener wiring removed from block-production path.
 
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE;
 use {
     crate::{
         banking_stage::BankingStage,
         banking_trace::{BankingTracer, TracerThread},
-        cluster_info_vote_listener::{
-            ClusterInfoVoteListener, DuplicateConfirmedSlotsSender, GossipVerifiedVoteHashSender,
-            VerifiedVoteSender, VoteTracker,
-        },
         fetch_stage::FetchStage,
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
-        tpu_entry_notifier::TpuEntryNotifier,
-        validator::{BlockProductionMethod, GeneratorConfig},
+        pow_service::{PowMiningService, SolvedPowBlock},
+        pos_service::{PosMintingService, MintedPosBlock, StakeUtxo},
+        consensus::{HybridConsensusEngine, MinerConfig},
     },
     bytes::Bytes,
     crossbeam_channel::{unbounded, Receiver},
     solana_client::connection_cache::ConnectionCache,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
-        blockstore::Blockstore, blockstore_processor::TransactionStatusSender,
-        entry_notifier_service::EntryNotifierSender,
+        blockstore::Blockstore,
+        blockstore_processor::TransactionStatusSender,
     },
-    solana_poh::poh_recorder::{PohRecorder, WorkingBankEntry},
+    solana_poh::poh_recorder::BlockRecorder,
     solana_rpc::{
         optimistically_confirmed_bank_tracker::BankNotificationSender,
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache},
-    solana_sdk::{clock::Slot, pubkey::Pubkey, quic::NotifyKeyUpdate, signature::Keypair},
+    solana_sdk::{
+        consensus::HybridConsensusConfig,
+        pubkey::Pubkey,
+        quic::NotifyKeyUpdate,
+        signature::Keypair,
+    },
     solana_streamer::{
         nonblocking::quic::DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
         quic::{spawn_server, SpawnServerResult, MAX_STAKED_CONNECTIONS, MAX_UNSTAKED_CONNECTIONS},
         streamer::StakedNodes,
     },
     solana_turbine::broadcast_stage::{BroadcastStage, BroadcastStageType},
-    solana_vote::vote_sender_types::{ReplayVoteReceiver, ReplayVoteSender},
     std::{
         collections::HashMap,
         net::{SocketAddr, UdpSocket},
@@ -49,7 +51,6 @@ use {
     tokio::sync::mpsc::Sender as AsyncSender,
 };
 
-// allow multiple connections for NAT and any open/close overlap
 pub const MAX_QUIC_CONNECTIONS_PER_PEER: usize = 8;
 
 pub struct TpuSockets {
@@ -64,41 +65,31 @@ pub struct TpuSockets {
 pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
-    vote_sigverify_stage: SigVerifyStage,
     banking_stage: BankingStage,
-    cluster_info_vote_listener: ClusterInfoVoteListener,
     broadcast_stage: BroadcastStage,
     tpu_quic_t: thread::JoinHandle<()>,
     tpu_forwards_quic_t: thread::JoinHandle<()>,
-    tpu_entry_notifier: Option<TpuEntryNotifier>,
     staked_nodes_updater_service: StakedNodesUpdaterService,
     tracer_thread_hdl: TracerThread,
+    pow_mining_service: Option<PowMiningService>,
+    pos_minting_service: Option<PosMintingService>,
 }
 
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cluster_info: &Arc<ClusterInfo>,
-        poh_recorder: &Arc<RwLock<PohRecorder>>,
-        entry_receiver: Receiver<WorkingBankEntry>,
-        retransmit_slots_receiver: Receiver<Slot>,
+        block_recorder: &Arc<RwLock<BlockRecorder>>,
         sockets: TpuSockets,
         subscriptions: &Arc<RpcSubscriptions>,
         transaction_status_sender: Option<TransactionStatusSender>,
-        entry_notification_sender: Option<EntryNotifierSender>,
         blockstore: Arc<Blockstore>,
         broadcast_type: &BroadcastStageType,
         exit: Arc<AtomicBool>,
         shred_version: u16,
-        vote_tracker: Arc<VoteTracker>,
         bank_forks: Arc<RwLock<BankForks>>,
-        verified_vote_sender: VerifiedVoteSender,
-        gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
-        replay_vote_receiver: ReplayVoteReceiver,
-        replay_vote_sender: ReplayVoteSender,
         bank_notification_sender: Option<BankNotificationSender>,
         tpu_coalesce: Duration,
-        duplicate_confirmed_slot_sender: DuplicateConfirmedSlotsSender,
         connection_cache: &Arc<ConnectionCache>,
         turbine_quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         keypair: &Keypair,
@@ -109,8 +100,10 @@ impl Tpu {
         tracer_thread_hdl: TracerThread,
         tpu_enable_udp: bool,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
-        block_production_method: BlockProductionMethod,
-        _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
+        // Hybrid consensus
+        consensus_engine: Arc<HybridConsensusEngine>,
+        miner_config: MinerConfig,
+        utxo_source: Arc<dyn Fn() -> Vec<StakeUtxo> + Send + Sync + 'static>,
     ) -> (Self, Vec<Arc<dyn NotifyKeyUpdate + Sync + Send>>) {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -122,20 +115,18 @@ impl Tpu {
         } = sockets;
 
         let (packet_sender, packet_receiver) = unbounded();
-        let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
+
         let fetch_stage = FetchStage::new_with_sender(
             transactions_sockets,
             tpu_forwards_sockets,
             tpu_vote_sockets,
             exit.clone(),
             &packet_sender,
-            &vote_packet_sender,
+            &packet_sender.clone(),
             &forwarded_packet_sender,
             forwarded_packet_receiver,
-            poh_recorder,
             tpu_coalesce,
-            Some(bank_forks.read().unwrap().get_vote_only_mode_signal()),
             tpu_enable_udp,
         );
 
@@ -182,7 +173,7 @@ impl Tpu {
             MAX_QUIC_CONNECTIONS_PER_PEER,
             staked_nodes.clone(),
             MAX_STAKED_CONNECTIONS.saturating_add(MAX_UNSTAKED_CONNECTIONS),
-            0, // Prevent unstaked nodes from forwarding transactions
+            0,
             DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
             tpu_coalesce,
         )
@@ -193,71 +184,30 @@ impl Tpu {
             SigVerifyStage::new(packet_receiver, verifier, "solSigVerTpu", "tpu-verifier")
         };
 
-        let (tpu_vote_sender, tpu_vote_receiver) = banking_tracer.create_channel_tpu_vote();
-
-        let vote_sigverify_stage = {
-            let verifier = TransactionSigVerifier::new_reject_non_vote(tpu_vote_sender);
-            SigVerifyStage::new(
-                vote_packet_receiver,
-                verifier,
-                "solSigVerTpuVot",
-                "tpu-vote-verifier",
-            )
-        };
-
-        let (gossip_vote_sender, gossip_vote_receiver) =
-            banking_tracer.create_channel_gossip_vote();
-        let cluster_info_vote_listener = ClusterInfoVoteListener::new(
-            exit.clone(),
-            cluster_info.clone(),
-            gossip_vote_sender,
-            poh_recorder.clone(),
-            vote_tracker,
-            bank_forks.clone(),
-            subscriptions.clone(),
-            verified_vote_sender,
-            gossip_verified_vote_hash_sender,
-            replay_vote_receiver,
-            blockstore.clone(),
-            bank_notification_sender,
-            duplicate_confirmed_slot_sender,
-        );
-
-        let banking_stage = BankingStage::new(
-            block_production_method,
+        let banking_stage = BankingStage::new_with_block_recorder(
             cluster_info,
-            poh_recorder,
+            block_recorder,
             non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
             transaction_status_sender,
-            replay_vote_sender,
             log_messages_bytes_limit,
             connection_cache.clone(),
             bank_forks.clone(),
             prioritization_fee_cache,
         );
 
-        let (entry_receiver, tpu_entry_notifier) =
-            if let Some(entry_notification_sender) = entry_notification_sender {
-                let (broadcast_entry_sender, broadcast_entry_receiver) = unbounded();
-                let tpu_entry_notifier = TpuEntryNotifier::new(
-                    entry_receiver,
-                    entry_notification_sender,
-                    broadcast_entry_sender,
-                    exit.clone(),
-                );
-                (broadcast_entry_receiver, Some(tpu_entry_notifier))
-            } else {
-                (entry_receiver, None)
-            };
+        // Spawn PoW mining service.
+        let (pow_mining_service, _pow_rx) =
+            PowMiningService::new(Arc::clone(&consensus_engine), miner_config, exit.clone());
 
+        // Spawn PoS minting service.
+        let (pos_minting_service, _pos_rx) =
+            PosMintingService::new(Arc::clone(&consensus_engine), exit.clone(), utxo_source);
+
+        // Broadcast stage: takes sealed blocks from the block recorder.
         let broadcast_stage = broadcast_type.new_broadcast_stage(
             broadcast_sockets,
             cluster_info.clone(),
-            entry_receiver,
-            retransmit_slots_receiver,
-            exit,
+            exit.clone(),
             blockstore,
             bank_forks,
             shred_version,
@@ -268,45 +218,32 @@ impl Tpu {
             Self {
                 fetch_stage,
                 sigverify_stage,
-                vote_sigverify_stage,
                 banking_stage,
-                cluster_info_vote_listener,
                 broadcast_stage,
                 tpu_quic_t,
                 tpu_forwards_quic_t,
-                tpu_entry_notifier,
                 staked_nodes_updater_service,
                 tracer_thread_hdl,
+                pow_mining_service: Some(pow_mining_service),
+                pos_minting_service: Some(pos_minting_service),
             },
             vec![key_updater, forwards_key_updater],
         )
     }
 
     pub fn join(self) -> thread::Result<()> {
-        let results = vec![
-            self.fetch_stage.join(),
-            self.sigverify_stage.join(),
-            self.vote_sigverify_stage.join(),
-            self.cluster_info_vote_listener.join(),
-            self.banking_stage.join(),
-            self.staked_nodes_updater_service.join(),
-            self.tpu_quic_t.join(),
-            self.tpu_forwards_quic_t.join(),
-        ];
-        let broadcast_result = self.broadcast_stage.join();
-        for result in results {
-            result?;
-        }
-        if let Some(tpu_entry_notifier) = self.tpu_entry_notifier {
-            tpu_entry_notifier.join()?;
-        }
-        let _ = broadcast_result?;
+        self.fetch_stage.join()?;
+        self.sigverify_stage.join()?;
+        self.banking_stage.join()?;
+        self.staked_nodes_updater_service.join()?;
+        self.tpu_quic_t.join()?;
+        self.tpu_forwards_quic_t.join()?;
+        if let Some(s) = self.pow_mining_service { s.join(); }
+        if let Some(s) = self.pos_minting_service { s.join(); }
+        let _ = self.broadcast_stage.join();
         if let Some(tracer_thread_hdl) = self.tracer_thread_hdl {
-            if let Err(tracer_result) = tracer_thread_hdl.join()? {
-                error!(
-                    "banking tracer thread returned error after successful thread join: {:?}",
-                    tracer_result
-                );
+            if let Err(e) = tracer_thread_hdl.join()? {
+                error!("banking tracer thread error: {:?}", e);
             }
         }
         Ok(())

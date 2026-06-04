@@ -1,5 +1,4 @@
 //! PoS minting service — checks UTXO eligibility and mints PoS blocks.
-//! Runs on its own thread alongside the PoW mining service.
 
 use {
     crate::consensus::{
@@ -20,33 +19,21 @@ use {
     },
 };
 
-// ---------------------------------------------------------------------------
-// UTXO record passed to the minting service
-// ---------------------------------------------------------------------------
-
-/// A spendable output eligible for PoS minting.
 #[derive(Clone, Debug)]
 pub struct StakeUtxo {
-    /// The owner of this UTXO (receives the minting reward).
     pub owner: Pubkey,
-    /// Value in lamports.
     pub lamports: u64,
-    /// Unix timestamp when this UTXO was confirmed.
     pub confirmation_time: u64,
-    /// Hash of the transaction that created this UTXO.
     pub txout_hash: [u8; 32],
-    /// Output index within that transaction.
     pub txout_n: u32,
 }
 
 impl StakeUtxo {
-    /// Seconds the coin has been held (coin age).
     pub fn held_secs(&self, now: u64) -> u64 {
         now.saturating_sub(self.confirmation_time)
     }
 }
 
-/// A minted PoS block header ready for the banking/replay stage.
 #[derive(Debug)]
 pub struct MintedPosBlock {
     pub height: u64,
@@ -58,31 +45,21 @@ pub struct MintedPosBlock {
     pub consensus_data: BlockConsensusData,
 }
 
-// ---------------------------------------------------------------------------
-// PoS minting service
-// ---------------------------------------------------------------------------
-
 pub struct PosMintingService {
     thread: JoinHandle<()>,
 }
 
 impl PosMintingService {
-    /// Spawn the PoS minting thread.
-    /// `utxo_source` is a closure that returns the current list of stake UTXOs.
     pub fn new(
         engine: Arc<HybridConsensusEngine>,
         exit: Arc<AtomicBool>,
         utxo_source: Arc<dyn Fn() -> Vec<StakeUtxo> + Send + Sync + 'static>,
     ) -> (Self, Receiver<MintedPosBlock>) {
         let (sender, receiver) = mpsc::sync_channel::<MintedPosBlock>(8);
-
         let thread = thread::Builder::new()
             .name("pos-minter".to_string())
-            .spawn(move || {
-                Self::minting_loop(engine, exit, sender, utxo_source);
-            })
+            .spawn(move || Self::minting_loop(engine, exit, sender, utxo_source))
             .expect("failed to spawn PoS minting thread");
-
         (Self { thread }, receiver)
     }
 
@@ -95,53 +72,25 @@ impl PosMintingService {
         while !exit.load(Ordering::Relaxed) {
             let tip = engine.tip();
             let now = unix_now();
-            let utxos = utxo_source();
-
-            for utxo in &utxos {
-                if exit.load(Ordering::Relaxed) {
-                    return;
-                }
-
+            for utxo in utxo_source().iter() {
+                if exit.load(Ordering::Relaxed) { return; }
                 let held_secs = utxo.held_secs(now);
-                let coin_age = engine
-                    .config_ref()
-                    .pos
-                    .coin_age(utxo.lamports, held_secs);
-
-                let kernel = pos_kernel_hash(
-                    &tip.stake_modifier,
-                    &utxo.txout_hash,
-                    utxo.txout_n,
-                    now,
-                );
-
-                if let Some(consensus_data) = engine.try_pos_mint(
-                    utxo.lamports,
-                    held_secs,
-                    coin_age,
-                    &kernel,
-                ) {
-                    let reward = engine
-                        .config_ref()
-                        .pos
-                        .staking_reward(utxo.lamports, held_secs);
-
-                    let minted = MintedPosBlock {
+                let coin_age = engine.config_ref().pos.coin_age(utxo.lamports, held_secs);
+                let kernel = pos_kernel_hash(&tip.stake_modifier, &utxo.txout_hash, utxo.txout_n, now);
+                if let Some(data) = engine.try_pos_mint(utxo.lamports, held_secs, coin_age, &kernel) {
+                    let reward = engine.config_ref().pos.staking_reward(utxo.lamports, held_secs);
+                    let _ = sender.try_send(MintedPosBlock {
                         height: tip.height + 1,
                         parent_hash: tip.hash,
                         block_time: now,
                         staker_pubkey: utxo.owner,
                         staking_reward: reward,
                         coin_age_consumed: coin_age,
-                        consensus_data,
-                    };
-
-                    let _ = sender.try_send(minted);
-                    break; // one block per loop iteration
+                        consensus_data: data,
+                    });
+                    break;
                 }
             }
-
-            // Sleep between minting attempts to avoid busy-waiting.
             thread::sleep(Duration::from_millis(500));
         }
     }
