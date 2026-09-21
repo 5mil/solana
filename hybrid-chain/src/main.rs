@@ -6,9 +6,15 @@ mod params;
 use chain::blockchain::Blockchain;
 use chain::pool::DefaultPool;
 use params::CHAIN_PARAMS;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process;
 
-fn main() {
-    env_logger::init();
+fn default_data_path() -> PathBuf {
+    PathBuf::from("data/chain.bin")
+}
+
+fn print_banner() {
     println!("=== Hybrid SHA256d PoW/PoS Node ===");
     println!("Chain: {}", CHAIN_PARAMS.name);
     println!("Ticker: {}", CHAIN_PARAMS.ticker);
@@ -16,12 +22,17 @@ fn main() {
     println!("PoW Block Reward: {} coins", CHAIN_PARAMS.pow_block_reward);
     println!("PoS Annual Rate: {}%", CHAIN_PARAMS.pos_annual_rate * 100.0);
     println!("Default pool: {}", DefaultPool::name());
+}
 
+fn mine_and_persist(path: &Path) {
+    print_banner();
     let mut blockchain = Blockchain::new();
-    println!("\nGenesis block created: {}", hex::encode(blockchain.tip_hash()));
+    println!(
+        "\nGenesis block created: {}",
+        hex::encode(blockchain.tip_hash())
+    );
 
     let pool = DefaultPool::new();
-
     let pow_block = blockchain.mine_pow_block("miner_address_here");
     println!(
         "Mined PoW block #{}: {}",
@@ -37,22 +48,65 @@ fn main() {
             share.nonce,
             hex::encode(share.hash)
         ),
-        Err(e) => println!("Pool rejected share: {:?}", e),
+        Err(e) => {
+            println!("Pool rejected share: {:?}", e);
+            process::exit(1);
+        }
     }
 
-    let stake_result = blockchain.mint_pos_block("staker_address_here", CHAIN_PARAMS.min_stake);
-    match stake_result {
-        Ok(pos_block) => println!(
-            "Minted PoS block #{}: {}",
-            pos_block.header.height,
-            hex::encode(pos_block.hash())
-        ),
-        Err(e) => println!("PoS mint failed: {}", e),
-    }
-
+    blockchain.save_to_path(path).unwrap_or_else(|e| {
+        eprintln!("failed to persist chain: {:?}", e);
+        process::exit(1);
+    });
+    println!("Persisted chain to {}", path.display());
     println!(
         "Pool stats: accepted={} rejected={}",
         pool.accepted_count(),
         pool.rejected_count()
     );
+}
+
+fn replay(path: &Path) {
+    print_banner();
+    println!("\nReplaying chain from {}", path.display());
+    let chain = Blockchain::load_from_path(path).unwrap_or_else(|e| {
+        eprintln!("failed to load chain: {:?}", e);
+        process::exit(1);
+    });
+    chain.revalidate().unwrap_or_else(|e| {
+        eprintln!("revalidation failed: {:?}", e);
+        process::exit(1);
+    });
+    println!(
+        "Revalidated {} blocks. Tip: {}",
+        chain.height(),
+        hex::encode(chain.tip_hash())
+    );
+    if chain.height() < 2 {
+        eprintln!("expected at least genesis + one PoW block");
+        process::exit(1);
+    }
+    let pow = &chain.blocks[1];
+    println!(
+        "Stored PoW block #{} still valid: {}",
+        pow.header.height,
+        hex::encode(pow.hash())
+    );
+}
+
+fn main() {
+    env_logger::init();
+    let args: Vec<String> = env::args().collect();
+    let replay_mode = args.iter().any(|a| a == "--replay");
+    let data_path = args
+        .windows(2)
+        .find(|w| w[0] == "--data")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or_else(default_data_path);
+
+    if replay_mode {
+        replay(&data_path);
+    } else {
+        mine_and_persist(&data_path);
+    }
 }
