@@ -7,6 +7,7 @@ use crate::consensus::pos;
 use crate::consensus::difficulty;
 use crate::params::CHAIN_PARAMS;
 
+#[derive(Debug)]
 pub struct Blockchain {
     pub blocks: Vec<Block>,
     pub block_index: HashMap<[u8; 32], usize>,
@@ -59,7 +60,6 @@ impl Blockchain {
         self.blocks.len() as u64
     }
 
-    /// Mine a new PoW block. Nonce search uses the same preimage as Block::hash.
     pub fn mine_pow_block(&mut self, miner_address: &str) -> Block {
         let prev_hash = self.tip_hash();
         let height = self.height();
