@@ -15,7 +15,6 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
-    /// Initialize with the genesis block
     pub fn new() -> Self {
         let mut chain = Blockchain {
             blocks: Vec::new(),
@@ -60,7 +59,7 @@ impl Blockchain {
         self.blocks.len() as u64
     }
 
-    /// Mine a new PoW block (SHA256d)
+    /// Mine a new PoW block. Nonce search uses the same preimage as Block::hash.
     pub fn mine_pow_block(&mut self, miner_address: &str) -> Block {
         let prev_hash = self.tip_hash();
         let height = self.height();
@@ -70,8 +69,7 @@ impl Blockchain {
         let merkle = Block::compute_merkle_root(&txs);
         let now = Utc::now().timestamp();
 
-        // Build header bytes for mining (without nonce)
-        let proto_header = BlockHeader {
+        let mut header = BlockHeader {
             version: 1,
             height,
             prev_hash,
@@ -82,11 +80,18 @@ impl Blockchain {
             nonce: 0,
             stake_modifier: [0u8; 32],
         };
-        let header_bytes = bincode::serialize(&proto_header).unwrap_or_default();
-        let (nonce, _hash) = pow::mine(&header_bytes, self.current_difficulty);
 
-        let final_header = BlockHeader { nonce, ..proto_header };
-        let block = Block { header: final_header, transactions: txs };
+        let mut nonce: u64 = 0;
+        loop {
+            header.nonce = nonce;
+            let hash = pow::sha256d(&bincode::serialize(&header).unwrap_or_default());
+            if pow::meets_difficulty(&hash, self.current_difficulty) {
+                break;
+            }
+            nonce = nonce.wrapping_add(1);
+        }
+
+        let block = Block { header, transactions: txs };
         let block_hash = block.hash();
 
         self.block_index.insert(block_hash, self.blocks.len());
@@ -98,9 +103,8 @@ impl Blockchain {
         block
     }
 
-    /// Mint a new PoS block (coin-age based staking)
     pub fn mint_pos_block(&mut self, staker_address: &str, stake_coins: u64) -> Result<Block, &'static str> {
-        let seconds_held: u64 = CHAIN_PARAMS.pos_coin_age_min + 3600; // assume mature stake
+        let seconds_held: u64 = CHAIN_PARAMS.pos_coin_age_min + 3600;
         pos::validate_stake(stake_coins, seconds_held)?;
 
         let reward = pos::pos_reward(stake_coins, seconds_held);
@@ -119,8 +123,8 @@ impl Blockchain {
             timestamp: now,
             difficulty: self.current_difficulty,
             block_type: BlockType::PoS,
-            nonce: 0, // PoS doesn't use nonce
-            stake_modifier: [0u8; 32], // TODO: derive from stake kernel
+            nonce: 0,
+            stake_modifier: [0u8; 32],
         };
 
         let block = Block { header, transactions: txs };
@@ -134,7 +138,6 @@ impl Blockchain {
         Ok(block)
     }
 
-    /// Halving schedule: reward halves every 210,000 blocks (Bitcoin-style)
     pub fn current_pow_reward(&self) -> u64 {
         let halvings = self.height() / 210_000;
         if halvings >= 64 { return 0; }
@@ -152,5 +155,40 @@ impl Blockchain {
             self.current_difficulty = difficulty::retarget(self.current_difficulty, actual, target);
             log::info!("Difficulty retarget: {} bits", self.current_difficulty);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::pow::{meets_difficulty, sha256d};
+
+    #[test]
+    fn genesis_is_height_one_tip_after_pow() {
+        let mut chain = Blockchain::new();
+        assert_eq!(chain.height(), 1);
+        let block = chain.mine_pow_block("miner");
+        assert_eq!(block.header.height, 1);
+        assert_eq!(chain.height(), 2);
+        let bytes = bincode::serialize(&block.header).unwrap();
+        let hash = sha256d(&bytes);
+        assert!(meets_difficulty(&hash, block.header.difficulty));
+        assert_eq!(block.hash(), hash);
+    }
+
+    #[test]
+    fn pos_rejects_below_min_stake() {
+        let mut chain = Blockchain::new();
+        assert!(chain.mint_pos_block("staker", 1).is_err());
+    }
+
+    #[test]
+    fn pos_accepts_min_stake() {
+        let mut chain = Blockchain::new();
+        let block = chain
+            .mint_pos_block("staker", CHAIN_PARAMS.min_stake)
+            .expect("pos mint");
+        assert_eq!(block.header.block_type, BlockType::PoS);
+        assert_eq!(block.header.height, 1);
     }
 }
