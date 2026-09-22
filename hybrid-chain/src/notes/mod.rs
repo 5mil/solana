@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod commitment;
+pub mod epoch;
 pub mod membership;
 pub mod payout;
 pub mod relay;
@@ -15,6 +16,7 @@ pub use action::{ActionBundle, CompactAction, CompactOutput, CompactSpend};
 pub use commitment::{
     blinding_from_seed, verify_balance, PedersenGenerators, ValueCommitment,
 };
+pub use epoch::{EpochForest, ScaleProof, EPOCH_CAP, EPOCH_DEPTH};
 pub use membership::MembershipProof;
 pub use payout::{discovery_tag, SealedPayout};
 pub use spend::transfer_bundle;
