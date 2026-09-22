@@ -4,6 +4,7 @@ use super::action::{
     ActionBundle, CompactAction, CompactOutput, CompactSpend, BUNDLE_PAD,
 };
 use super::commitment::{PedersenGenerators, ValueCommitment};
+use super::launch::LaunchSet;
 use super::membership::MembershipProof;
 use super::payout::discovery_tag;
 use super::tags::SpendTagSet;
@@ -49,6 +50,64 @@ pub fn transfer_bundle(
                 value_commitment: in_c,
                 dummy: false,
                 membership: Some(proof),
+                hidden: None,
+            }),
+            output: Some(CompactOutput {
+                one_time_dest: out_dest,
+                discovery_tag: discovery_tag(out_scan, 0),
+                value_commitment: out_c,
+                dummy: false,
+                asset_id,
+            }),
+        }],
+        fee_commitment: fee_c,
+        coinbase: false,
+    }
+    .pad_to(BUNDLE_PAD);
+    if !bundle.verify_conservation() {
+        return Err("homomorphic conservation failed");
+    }
+    Ok(bundle)
+}
+
+/// Launch spend: membership is a HiddenProof against the sorted window.
+/// No epoch_index / epoch_root on the bundle.
+pub fn transfer_window_bundle(
+    spend_secret: &[u8; 32],
+    set: &LaunchSet,
+    in_value: u64,
+    in_blind: &Scalar,
+    out_dest: [u8; 32],
+    out_scan: &[u8],
+    out_value: u64,
+    out_blind: &Scalar,
+    fee_value: u64,
+    fee_blind: &Scalar,
+    asset_id: [u8; 32],
+) -> Result<ActionBundle, &'static str> {
+    if in_value != out_value.saturating_add(fee_value) {
+        return Err("plaintext values do not conserve");
+    }
+    let gens = PedersenGenerators::default();
+    let in_c = ValueCommitment::commit(in_value, in_blind, &gens);
+    let hidden = set.prove(in_c.commitment).ok_or("leaf not in window")?;
+    if !hidden.verify(set.window_root()) {
+        return Err("hidden membership failed");
+    }
+    let tag = SpendTagSet::derive(spend_secret, &hidden.leaf);
+    let out_c = ValueCommitment::commit(out_value, out_blind, &gens);
+    let fee_c = ValueCommitment::commit(fee_value, fee_blind, &gens);
+    let bundle = ActionBundle {
+        version: 1,
+        actions: vec![CompactAction {
+            spend: Some(CompactSpend {
+                prev_txid: [0u8; 32],
+                prev_vout: 0,
+                spend_tag: tag,
+                value_commitment: in_c,
+                dummy: false,
+                membership: None,
+                hidden: Some(hidden),
             }),
             output: Some(CompactOutput {
                 one_time_dest: out_dest,
@@ -72,6 +131,7 @@ pub fn transfer_bundle(
 mod tests {
     use super::*;
     use crate::notes::commitment::blinding_from_seed;
+    use crate::notes::launch::ProfileKind;
     use crate::notes::tree::NoteCommitmentTree;
 
     #[test]
@@ -102,6 +162,36 @@ mod tests {
         assert!(b.verify_conservation());
         assert_eq!(b.real_spends().len(), 1);
         assert_eq!(b.actions.len(), BUNDLE_PAD);
+    }
+
+    #[test]
+    fn window_transfer_hides_epoch_and_conserves() {
+        let gens = PedersenGenerators::default();
+        let r_in = blinding_from_seed(b"win");
+        let leaf = ValueCommitment::commit(40, &r_in, &gens).commitment;
+        let mut set = LaunchSet::new(ProfileKind::Constrained);
+        set.append(leaf);
+        let r_out = blinding_from_seed(b"wout");
+        let r_fee = r_in - r_out;
+        let b = transfer_window_bundle(
+            &[8u8; 32],
+            &set,
+            40,
+            &r_in,
+            [4u8; 32],
+            b"scan",
+            30,
+            &r_out,
+            10,
+            &r_fee,
+            [0u8; 32],
+        )
+        .expect("window bundle");
+        let spend = b.real_spends()[0];
+        assert!(spend.membership.is_none());
+        assert!(spend.hidden.is_some());
+        assert!(spend.hidden.as_ref().unwrap().verify(set.window_root()));
+        assert!(b.verify_conservation());
     }
 
     #[test]

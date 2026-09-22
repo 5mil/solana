@@ -14,6 +14,7 @@ pub struct CompactSpend {
     pub value_commitment: ValueCommitment,
     pub dummy: bool,
     pub membership: Option<crate::notes::membership::MembershipProof>,
+    pub hidden: Option<crate::notes::launch::HiddenProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +51,7 @@ impl ActionBundle {
                     value_commitment: ValueCommitment::identity(),
                     dummy: true,
                     membership: None,
+                    hidden: None,
                 }),
                 output: Some(CompactOutput {
                     one_time_dest: [0u8; 32],
