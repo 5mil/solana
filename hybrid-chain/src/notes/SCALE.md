@@ -1,21 +1,28 @@
-# Bounded-epoch membership (instead of unbounded FCMP++)
+# Launch membership vs full-chain proofs
 
-FCMP++ proves “this output is one of every output ever.” The proving tree and
-prover work grow with the whole chain. That is the scale problem.
+Full-chain membership proves “this output is one of every output ever.”
+Prover work and node RAM grow with the chain.
 
-This crate seals the live note tree every `EPOCH_CAP` (2^16) leaves. A spend
-carries a **fixed-size** `ScaleProof`:
+## What launch does
 
-- in-epoch path padded to 16 hashes
-- forest path padded to 16 hashes
-- 1098 bytes always, until 2^32 notes
+1. **Hide the window.** `HiddenProof` has leaf + sibling path + side bits.
+   No `epoch_index`, no `epoch_root`. The tree is the **sorted** union of
+   the last W sealed epochs plus live. Rank is not insertion time.
+2. **Keep epochs populated.** `seal()` pads live to the profile bucket with
+   deterministic dummy leaves. Quiet networks do not publish short epochs.
+   `ProfileKind::recommend` maps load + RAM → Constrained / Sparse /
+   Standard / Dense.
+3. **Fold.** Each seal: `forest_acc = H(forest_acc || epoch_root)`.
+   Header commitment = `H(window_root || forest_acc)` (32 bytes).
+   Notes that leave the window must refresh. There is no proof against
+   all of history, so verify does not grow with height.
 
-Nodes keep sealed epoch **roots**, not every historical leaf. Wallets keep the
-path for notes they own. Verifying a spend does not scan the chain.
+## Proof size
 
-Anonymity set per spend is the epoch (65 536 notes) plus “this epoch root is in
-the forest.” Hiding `epoch_index` on the wire needs a circuit over the forest
-peaks (next). Until then the proof still names the epoch; cost does not.
+`HiddenProof` is always `32 + 4 + 20*32 + 1 = 677` bytes, any profile.
 
-`notes_root` stays `live.root()` until the first epoch seals, so current tests
-and `chain.bin` layout for short chains are unchanged.
+## Cutover
+
+`transfer_window_bundle` is the launch spend constructor.
+`Blockchain.notes` still feeds the older live-tree path until persist
+rebuild is switched to `LaunchSet`.
