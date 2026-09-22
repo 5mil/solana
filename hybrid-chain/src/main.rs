@@ -2,9 +2,11 @@ mod consensus;
 mod chain;
 mod wallet;
 mod params;
+mod notes;
 
 use chain::blockchain::Blockchain;
 use chain::pool::DefaultPool;
+use notes::payout::SealedPayout;
 use params::CHAIN_PARAMS;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -22,6 +24,7 @@ fn print_banner() {
     println!("PoW Block Reward: {} coins", CHAIN_PARAMS.pow_block_reward);
     println!("PoS Annual Rate: {}%", CHAIN_PARAMS.pos_annual_rate * 100.0);
     println!("Default pool: {}", DefaultPool::name());
+    println!("Notes: compact coinbase + commitment tree + spend tags");
 }
 
 fn mine_and_persist(path: &Path) {
@@ -31,16 +34,31 @@ fn mine_and_persist(path: &Path) {
         "\nGenesis block created: {}",
         hex::encode(blockchain.tip_hash())
     );
+    println!(
+        "Genesis notes_root: {}",
+        hex::encode(blockchain.notes.root())
+    );
 
     let pool = DefaultPool::new();
-    let pow_block = blockchain.mine_pow_block("miner_address_here");
+    let miner = "miner_address_here";
+    let pow_block = blockchain.mine_pow_block(miner);
+    let sealed = SealedPayout::from_ticket(miner.as_bytes(), pow_block.header.height);
     println!(
         "Mined PoW block #{}: {}",
         pow_block.header.height,
         hex::encode(pow_block.hash())
     );
+    println!(
+        "Sealed payout dest: {} (worker label not used as dest)",
+        hex::encode(sealed.dest)
+    );
+    println!(
+        "notes_root={} tags_root={}",
+        hex::encode(pow_block.header.notes_root),
+        hex::encode(pow_block.header.tags_root)
+    );
 
-    match pool.submit_block("miner_address_here", &pow_block) {
+    match pool.submit_block(miner, &pow_block) {
         Ok(share) => println!(
             "Accepted by {}: height={} nonce={} hash={}",
             DefaultPool::name(),
@@ -91,6 +109,11 @@ fn replay(path: &Path) {
         "Stored PoW block #{} still valid: {}",
         pow.header.height,
         hex::encode(pow.hash())
+    );
+    println!(
+        "notes_root={} compact_actions={}",
+        hex::encode(pow.header.notes_root),
+        pow.compact.first().map(|b| b.actions.len()).unwrap_or(0)
     );
 }
 
