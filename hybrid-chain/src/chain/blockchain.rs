@@ -12,6 +12,28 @@ use crate::notes::tags::SpendTagSet;
 use crate::notes::tree::NoteCommitmentTree;
 use crate::params::CHAIN_PARAMS;
 
+pub(crate) fn verify_bundle_against(
+    tree: &NoteCommitmentTree,
+    bundle: &ActionBundle,
+) -> Result<(), &'static str> {
+    if !bundle.verify_conservation() {
+        return Err("conservation failed");
+    }
+    if bundle.coinbase {
+        return Ok(());
+    }
+    for spend in bundle.real_spends() {
+        let proof = spend.membership.as_ref().ok_or("missing membership")?;
+        if proof.leaf != spend.value_commitment.commitment {
+            return Err("membership leaf mismatch");
+        }
+        if !proof.verify(tree.root()) {
+            return Err("membership failed");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Blockchain {
     pub blocks: Vec<Block>,
@@ -37,9 +59,7 @@ impl Blockchain {
     }
 
     fn append_bundle(&mut self, bundle: &ActionBundle) -> Result<(), &'static str> {
-        if !bundle.verify_conservation() {
-            return Err("conservation failed");
-        }
+        verify_bundle_against(&self.notes, bundle)?;
         for tag in bundle.spend_tags() {
             self.tags.insert(tag)?;
         }
@@ -47,6 +67,13 @@ impl Blockchain {
             self.notes.append(c);
         }
         Ok(())
+    }
+
+    pub fn apply_transfer(&mut self, bundle: &ActionBundle) -> Result<(), &'static str> {
+        if bundle.coinbase {
+            return Err("use emission path for coinbase");
+        }
+        self.append_bundle(bundle)
     }
 
     fn emission_bundle(&self, ticket: &str, height: u64, reward: u64) -> ActionBundle {
@@ -58,7 +85,8 @@ impl Blockchain {
     }
 
     fn create_genesis(&mut self) {
-        let genesis_tx = Transaction::coinbase(0, CHAIN_PARAMS.pow_block_reward, "genesis");
+        let genesis_sealed = SealedPayout::from_ticket(b"genesis", 0);
+        let genesis_tx = Transaction::coinbase(0, CHAIN_PARAMS.pow_block_reward, &genesis_sealed.dest);
         let txs = vec![genesis_tx];
         let merkle = Block::compute_merkle_root(&txs);
         let bundle = self.emission_bundle("genesis", 0, CHAIN_PARAMS.pow_block_reward);
@@ -93,10 +121,18 @@ impl Blockchain {
     }
 
     pub fn mine_pow_block(&mut self, miner_address: &str) -> Block {
+        self.mine_pow_with_bundles(miner_address, Vec::new())
+    }
+
+    pub fn mine_pow_with_bundles(&mut self, miner_address: &str, extra: Vec<ActionBundle>) -> Block {
+        for b in &extra {
+            self.append_bundle(b).expect("extra compact bundle");
+        }
         let prev_hash = self.tip_hash();
         let height = self.height();
         let reward = self.current_pow_reward();
-        let coinbase = Transaction::coinbase(height, reward, miner_address);
+        let sealed = SealedPayout::from_ticket(miner_address.as_bytes(), height);
+        let coinbase = Transaction::coinbase(height, reward, &sealed.dest);
         let txs = vec![coinbase];
         let merkle = Block::compute_merkle_root(&txs);
         let now = Utc::now().timestamp();
@@ -124,7 +160,9 @@ impl Blockchain {
             }
             nonce = nonce.wrapping_add(1);
         }
-        let block = Block { header, transactions: txs, compact: vec![bundle] };
+        let mut compact = extra;
+        compact.push(bundle);
+        let block = Block { header, transactions: txs, compact };
         let block_hash = block.hash();
         self.block_index.insert(block_hash, self.blocks.len());
         self.total_supply += reward;
@@ -140,7 +178,8 @@ impl Blockchain {
         let reward = pos::pos_reward(stake_coins, seconds_held);
         let prev_hash = self.tip_hash();
         let height = self.height();
-        let coinstake = Transaction::coinstake(stake_coins, reward, staker_address);
+        let staker_sealed = SealedPayout::from_ticket(staker_address.as_bytes(), height);
+        let coinstake = Transaction::coinstake(stake_coins, reward, &staker_sealed.dest);
         let txs = vec![coinstake];
         let merkle = Block::compute_merkle_root(&txs);
         let now = Utc::now().timestamp();
@@ -192,9 +231,7 @@ impl Blockchain {
         self.tags = SpendTagSet::new();
         for block in &self.blocks {
             for bundle in &block.compact {
-                if !bundle.verify_conservation() {
-                    return Err("compact conservation failed");
-                }
+                verify_bundle_against(&self.notes, bundle)?;
                 for tag in bundle.spend_tags() {
                     self.tags.insert(tag)?;
                 }
@@ -217,6 +254,7 @@ impl Blockchain {
 mod tests {
     use super::*;
     use crate::consensus::pow::{meets_difficulty, sha256d};
+    use crate::notes::commitment::blinding_from_seed;
     use crate::notes::payout::SealedPayout;
 
     #[test]
@@ -264,5 +302,36 @@ mod tests {
         chain.rebuild_notes().expect("rebuild");
         assert_eq!(chain.notes.root(), notes);
         assert_eq!(chain.tags.root(), tags);
+    }
+
+    #[test]
+    fn spend_prior_note_and_reject_double_spend() {
+        let mut chain = Blockchain::new();
+        let _ = chain.mine_pow_block("miner");
+        let height = 1u64;
+        let sealed = SealedPayout::from_ticket(b"miner", height);
+        let reward = CHAIN_PARAMS.pow_block_reward;
+        let in_blind = blinding_from_seed(&[b"miner".as_ref(), &height.to_le_bytes()].concat());
+        let leaf_index = 1usize;
+        let r_out = blinding_from_seed(b"out");
+        let r_fee = in_blind - r_out;
+        let bundle = crate::notes::transfer_bundle(
+            &sealed.spend_secret(),
+            &chain.notes,
+            leaf_index,
+            reward,
+            &in_blind,
+            [42u8; 32],
+            b"recv-scan",
+            reward - 1,
+            &r_out,
+            1,
+            &r_fee,
+            [0u8; 32],
+        )
+        .expect("transfer");
+        let block = chain.mine_pow_with_bundles("miner2", vec![bundle.clone()]);
+        assert!(block.compact.len() >= 2);
+        assert!(chain.apply_transfer(&bundle).is_err());
     }
 }
