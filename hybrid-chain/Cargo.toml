@@ -17,3 +17,5 @@ rand = "0.8"
 log = "0.4"
 env_logger = "0.11"
 bincode = "1"
+curve25519-dalek = { version = "=4.1.1", features = ["digest"] }
+zeroize = { version = "=1.7.0" }
