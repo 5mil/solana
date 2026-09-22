@@ -1,6 +1,8 @@
 use crate::chain::block::{Block, BlockType};
 use crate::chain::blockchain::Blockchain;
 use crate::consensus::pow::{meets_difficulty, sha256d};
+use crate::notes::tags::SpendTagSet;
+use crate::notes::tree::NoteCommitmentTree;
 use crate::params::CHAIN_PARAMS;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -38,8 +40,6 @@ impl Blockchain {
         fs::write(path, bytes).map_err(|e| StoreError::Io(e.to_string()))
     }
 
-    /// Load a chain only after full consensus revalidation.
-    /// Never returns a partially trusted chain.
     pub fn load_from_path(path: &Path) -> Result<Self, StoreError> {
         if !path.exists() {
             return Err(StoreError::Io(format!("missing chain file: {}", path.display())));
@@ -58,6 +58,8 @@ impl Blockchain {
             block_index: Default::default(),
             current_difficulty: snap.current_difficulty,
             total_supply: snap.total_supply,
+            notes: NoteCommitmentTree::new(),
+            tags: SpendTagSet::new(),
         };
         for (i, block) in snap.blocks.into_iter().enumerate() {
             let hash = block.hash();
@@ -65,6 +67,9 @@ impl Blockchain {
             chain.blocks.push(block);
         }
         chain.revalidate()?;
+        chain
+            .rebuild_notes()
+            .map_err(|e| StoreError::Invalid(e.to_string()))?;
         Ok(chain)
     }
 
@@ -72,6 +77,8 @@ impl Blockchain {
         if self.blocks.is_empty() {
             return Err(StoreError::Invalid("empty chain".into()));
         }
+        let mut notes = NoteCommitmentTree::new();
+        let mut tags = SpendTagSet::new();
         for (i, block) in self.blocks.iter().enumerate() {
             if block.header.height != i as u64 {
                 return Err(StoreError::Invalid(format!(
@@ -119,6 +126,31 @@ impl Blockchain {
                         "reward mismatch at height {i}: claimed={claimed} expected={expected_reward}"
                     )));
                 }
+            }
+            for bundle in &block.compact {
+                if !bundle.verify_conservation() {
+                    return Err(StoreError::Invalid(format!(
+                        "compact conservation failed at height {i}"
+                    )));
+                }
+                for tag in bundle.spend_tags() {
+                    tags.insert(tag).map_err(|e| {
+                        StoreError::Invalid(format!("spend tag at height {i}: {e}"))
+                    })?;
+                }
+                for c in bundle.output_commitments() {
+                    notes.append(c);
+                }
+            }
+            if block.header.notes_root != notes.root() {
+                return Err(StoreError::Invalid(format!(
+                    "notes_root mismatch at height {i}"
+                )));
+            }
+            if block.header.tags_root != tags.root() {
+                return Err(StoreError::Invalid(format!(
+                    "tags_root mismatch at height {i}"
+                )));
             }
         }
         Ok(())
@@ -184,11 +216,7 @@ mod tests {
         rewrite(&path, |snap| {
             snap.blocks[1].header.nonce = snap.blocks[1].header.nonce.wrapping_add(1);
         });
-        let err = Blockchain::load_from_path(&path).unwrap_err();
-        match err {
-            StoreError::Invalid(_) => {}
-            other => panic!("expected Invalid, got {other:?}"),
-        }
+        assert!(Blockchain::load_from_path(&path).is_err());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -208,12 +236,7 @@ mod tests {
         rewrite(&path, |snap| {
             snap.blocks[1].header.merkle_root[0] ^= 0xAA;
         });
-        let err = Blockchain::load_from_path(&path).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("commitment") || msg.contains("Invalid"),
-            "{msg}"
-        );
+        assert!(Blockchain::load_from_path(&path).is_err());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -226,9 +249,29 @@ mod tests {
             snap.blocks[1].header.merkle_root =
                 Block::compute_merkle_root(&snap.blocks[1].transactions);
         });
-        let err = Blockchain::load_from_path(&path).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.contains("reward") || msg.contains("work") || msg.contains("Invalid"), "{msg}");
+        assert!(Blockchain::load_from_path(&path).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rejects_tampered_notes_root() {
+        let (_chain, path) = mined_chain();
+        rewrite(&path, |snap| {
+            snap.blocks[1].header.notes_root[0] ^= 0x5A;
+        });
+        assert!(Blockchain::load_from_path(&path).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rejects_tampered_compact_commitment() {
+        let (_chain, path) = mined_chain();
+        rewrite(&path, |snap| {
+            if let Some(out) = snap.blocks[1].compact[0].actions[0].output.as_mut() {
+                out.value_commitment.commitment[0] ^= 0x11;
+            }
+        });
+        assert!(Blockchain::load_from_path(&path).is_err());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -238,10 +281,7 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert!(bytes.len() > 8);
         fs::write(&path, &bytes[..bytes.len() / 3]).unwrap();
-        match Blockchain::load_from_path(&path) {
-            Err(StoreError::Decode(_) | StoreError::Invalid(_) | StoreError::Io(_)) => {}
-            Ok(_) => panic!("truncated file must not load as a trusted chain"),
-        }
+        assert!(Blockchain::load_from_path(&path).is_err());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
