@@ -16,13 +16,16 @@ impl SealedPayout {
         scan_buf.extend_from_slice(ticket);
         scan_buf.extend_from_slice(&height.to_le_bytes());
         let scan_seed = sha256d(&scan_buf);
-
         let mut dest_buf = Vec::new();
         dest_buf.extend_from_slice(b"one-time-dest");
         dest_buf.extend_from_slice(&scan_seed);
         dest_buf.extend_from_slice(&height.to_le_bytes());
         let dest = sha256d(&dest_buf);
         Self { dest, scan_seed }
+    }
+
+    pub fn spend_secret(&self) -> [u8; 32] {
+        sha256d(&[b"spend-seed".as_ref(), &self.scan_seed[..]].concat())
     }
 }
 
