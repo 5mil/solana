@@ -5,6 +5,11 @@ use crate::chain::transaction::Transaction;
 use crate::consensus::pow;
 use crate::consensus::pos;
 use crate::consensus::difficulty;
+use crate::notes::action::{coinbase_bundle, ActionBundle};
+use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
+use crate::notes::payout::SealedPayout;
+use crate::notes::tags::SpendTagSet;
+use crate::notes::tree::NoteCommitmentTree;
 use crate::params::CHAIN_PARAMS;
 
 #[derive(Debug)]
@@ -13,6 +18,8 @@ pub struct Blockchain {
     pub block_index: HashMap<[u8; 32], usize>,
     pub current_difficulty: u32,
     pub total_supply: u64,
+    pub notes: NoteCommitmentTree,
+    pub tags: SpendTagSet,
 }
 
 impl Blockchain {
@@ -22,16 +29,40 @@ impl Blockchain {
             block_index: HashMap::new(),
             current_difficulty: CHAIN_PARAMS.initial_difficulty,
             total_supply: 0,
+            notes: NoteCommitmentTree::new(),
+            tags: SpendTagSet::new(),
         };
         chain.create_genesis();
         chain
+    }
+
+    fn append_bundle(&mut self, bundle: &ActionBundle) -> Result<(), &'static str> {
+        if !bundle.verify_conservation() {
+            return Err("conservation failed");
+        }
+        for tag in bundle.spend_tags() {
+            self.tags.insert(tag)?;
+        }
+        for c in bundle.output_commitments() {
+            self.notes.append(c);
+        }
+        Ok(())
+    }
+
+    fn emission_bundle(&self, ticket: &str, height: u64, reward: u64) -> ActionBundle {
+        let sealed = SealedPayout::from_ticket(ticket.as_bytes(), height);
+        let gens = PedersenGenerators::default();
+        let blind = blinding_from_seed(&[ticket.as_bytes(), &height.to_le_bytes()].concat());
+        let commit = ValueCommitment::commit(reward, &blind, &gens);
+        coinbase_bundle(sealed.dest, &sealed.scan_seed, commit, [0u8; 32])
     }
 
     fn create_genesis(&mut self) {
         let genesis_tx = Transaction::coinbase(0, CHAIN_PARAMS.pow_block_reward, "genesis");
         let txs = vec![genesis_tx];
         let merkle = Block::compute_merkle_root(&txs);
-
+        let bundle = self.emission_bundle("genesis", 0, CHAIN_PARAMS.pow_block_reward);
+        self.append_bundle(&bundle).expect("genesis notes");
         let header = BlockHeader {
             version: 1,
             height: 0,
@@ -42,9 +73,10 @@ impl Blockchain {
             block_type: BlockType::PoW,
             nonce: 0,
             stake_modifier: [0u8; 32],
+            notes_root: self.notes.root(),
+            tags_root: self.tags.root(),
         };
-
-        let genesis = Block { header, transactions: txs };
+        let genesis = Block { header, transactions: txs, compact: vec![bundle] };
         let hash = genesis.hash();
         self.block_index.insert(hash, 0);
         self.total_supply += CHAIN_PARAMS.pow_block_reward;
@@ -68,7 +100,8 @@ impl Blockchain {
         let txs = vec![coinbase];
         let merkle = Block::compute_merkle_root(&txs);
         let now = Utc::now().timestamp();
-
+        let bundle = self.emission_bundle(miner_address, height, reward);
+        self.append_bundle(&bundle).expect("coinbase notes");
         let mut header = BlockHeader {
             version: 1,
             height,
@@ -79,8 +112,9 @@ impl Blockchain {
             block_type: BlockType::PoW,
             nonce: 0,
             stake_modifier: [0u8; 32],
+            notes_root: self.notes.root(),
+            tags_root: self.tags.root(),
         };
-
         let mut nonce: u64 = 0;
         loop {
             header.nonce = nonce;
@@ -90,15 +124,12 @@ impl Blockchain {
             }
             nonce = nonce.wrapping_add(1);
         }
-
-        let block = Block { header, transactions: txs };
+        let block = Block { header, transactions: txs, compact: vec![bundle] };
         let block_hash = block.hash();
-
         self.block_index.insert(block_hash, self.blocks.len());
         self.total_supply += reward;
         self.blocks.push(block.clone());
         self.maybe_retarget();
-
         log::info!("PoW block #{} mined: {} (nonce={})", height, hex::encode(block_hash), nonce);
         block
     }
@@ -106,7 +137,6 @@ impl Blockchain {
     pub fn mint_pos_block(&mut self, staker_address: &str, stake_coins: u64) -> Result<Block, &'static str> {
         let seconds_held: u64 = CHAIN_PARAMS.pos_coin_age_min + 3600;
         pos::validate_stake(stake_coins, seconds_held)?;
-
         let reward = pos::pos_reward(stake_coins, seconds_held);
         let prev_hash = self.tip_hash();
         let height = self.height();
@@ -114,7 +144,8 @@ impl Blockchain {
         let txs = vec![coinstake];
         let merkle = Block::compute_merkle_root(&txs);
         let now = Utc::now().timestamp();
-
+        let bundle = self.emission_bundle(staker_address, height, reward);
+        self.append_bundle(&bundle)?;
         let header = BlockHeader {
             version: 1,
             height,
@@ -125,15 +156,14 @@ impl Blockchain {
             block_type: BlockType::PoS,
             nonce: 0,
             stake_modifier: [0u8; 32],
+            notes_root: self.notes.root(),
+            tags_root: self.tags.root(),
         };
-
-        let block = Block { header, transactions: txs };
+        let block = Block { header, transactions: txs, compact: vec![bundle] };
         let block_hash = block.hash();
-
         self.block_index.insert(block_hash, self.blocks.len());
         self.total_supply += reward;
         self.blocks.push(block.clone());
-
         log::info!("PoS block #{} minted: {} (reward={})", height, hex::encode(block_hash), reward);
         Ok(block)
     }
@@ -156,12 +186,38 @@ impl Blockchain {
             log::info!("Difficulty retarget: {} bits", self.current_difficulty);
         }
     }
+
+    pub fn rebuild_notes(&mut self) -> Result<(), &'static str> {
+        self.notes = NoteCommitmentTree::new();
+        self.tags = SpendTagSet::new();
+        for block in &self.blocks {
+            for bundle in &block.compact {
+                if !bundle.verify_conservation() {
+                    return Err("compact conservation failed");
+                }
+                for tag in bundle.spend_tags() {
+                    self.tags.insert(tag)?;
+                }
+                for c in bundle.output_commitments() {
+                    self.notes.append(c);
+                }
+            }
+            if block.header.notes_root != self.notes.root() {
+                return Err("notes_root mismatch");
+            }
+            if block.header.tags_root != self.tags.root() {
+                return Err("tags_root mismatch");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::consensus::pow::{meets_difficulty, sha256d};
+    use crate::notes::payout::SealedPayout;
 
     #[test]
     fn genesis_is_height_one_tip_after_pow() {
@@ -174,6 +230,8 @@ mod tests {
         let hash = sha256d(&bytes);
         assert!(meets_difficulty(&hash, block.header.difficulty));
         assert_eq!(block.hash(), hash);
+        assert_ne!(block.header.notes_root, [0u8; 32]);
+        assert!(!block.compact.is_empty());
     }
 
     #[test]
@@ -185,10 +243,26 @@ mod tests {
     #[test]
     fn pos_accepts_min_stake() {
         let mut chain = Blockchain::new();
-        let block = chain
-            .mint_pos_block("staker", CHAIN_PARAMS.min_stake)
-            .expect("pos mint");
+        let block = chain.mint_pos_block("staker", CHAIN_PARAMS.min_stake).expect("pos mint");
         assert_eq!(block.header.block_type, BlockType::PoS);
         assert_eq!(block.header.height, 1);
+        assert_ne!(block.header.notes_root, [0u8; 32]);
+    }
+
+    #[test]
+    fn sealed_payout_is_not_worker_label() {
+        let sealed = SealedPayout::from_ticket(b"miner", 1);
+        assert_ne!(sealed.dest, [0u8; 32]);
+    }
+
+    #[test]
+    fn rebuild_notes_matches_live_roots() {
+        let mut chain = Blockchain::new();
+        let _ = chain.mine_pow_block("miner");
+        let notes = chain.notes.root();
+        let tags = chain.tags.root();
+        chain.rebuild_notes().expect("rebuild");
+        assert_eq!(chain.notes.root(), notes);
+        assert_eq!(chain.tags.root(), tags);
     }
 }
