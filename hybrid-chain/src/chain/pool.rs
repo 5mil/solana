@@ -1,8 +1,5 @@
 //! Default local mining pool.
-//!
-//! Miners submit solved PoW headers here. The pool validates SHA256d
-//! against the advertised difficulty and, on success, records the share
-//! as accepted work for the default pool.
+//! Share records store a ticket hash, never a payout dest.
 
 use crate::chain::block::{Block, BlockType};
 use crate::consensus::pow::{meets_difficulty, sha256d};
@@ -12,7 +9,7 @@ pub const DEFAULT_POOL_NAME: &str = "hybrid-default-pool";
 
 #[derive(Debug, Clone)]
 pub struct AcceptedShare {
-    pub miner: String,
+    pub ticket_hash: [u8; 32],
     pub height: u64,
     pub nonce: u64,
     pub hash: [u8; 32],
@@ -59,7 +56,7 @@ impl DefaultPool {
             return Err(SubmitError::InsufficientWork);
         }
         let share = AcceptedShare {
-            miner: miner.to_string(),
+            ticket_hash: sha256d(miner.as_bytes()),
             height: block.header.height,
             nonce: block.header.nonce,
             hash,
@@ -89,6 +86,8 @@ mod tests {
         let pool = DefaultPool::new();
         let share = pool.submit_block("pool-miner", &block).expect("share accepted");
         assert_eq!(share.height, 1);
+        assert_ne!(share.ticket_hash, [0u8; 32]);
+        assert_ne!(&share.ticket_hash[..], b"pool-miner");
         assert_eq!(pool.accepted_count(), 1);
         assert_eq!(pool.rejected_count(), 0);
     }

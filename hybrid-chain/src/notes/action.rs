@@ -13,6 +13,7 @@ pub struct CompactSpend {
     pub spend_tag: [u8; 32],
     pub value_commitment: ValueCommitment,
     pub dummy: bool,
+    pub membership: Option<crate::notes::membership::MembershipProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +49,7 @@ impl ActionBundle {
                     spend_tag: [0u8; 32],
                     value_commitment: ValueCommitment::identity(),
                     dummy: true,
+                    membership: None,
                 }),
                 output: Some(CompactOutput {
                     one_time_dest: [0u8; 32],
