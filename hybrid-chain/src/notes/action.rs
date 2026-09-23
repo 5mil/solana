@@ -1,9 +1,8 @@
-//! One action type. Padding is the identity point, not a trusted flag.
+//! One action type. No listed ring. Dest is a spend pubkey.
 
-use super::auth::{BindingSig, LinkProof, RangeProof};
-use super::commitment::{blinding_from_seed, verify_balance, PedersenGenerators, ValueCommitment};
-use super::payout::discovery_tag;
-use curve25519_dalek::scalar::Scalar;
+use super::commitment::{verify_balance, ValueCommitment};
+use super::keys::SpendPk;
+use super::proof::{BindingSig, EmissionOr, NoteProof};
 use serde::{Deserialize, Serialize};
 
 pub const BUNDLE_PAD: usize = 2;
@@ -12,18 +11,15 @@ pub const BUNDLE_PAD: usize = 2;
 pub struct CompactSpend {
     pub spend_tag: [u8; 32],
     pub rerand: ValueCommitment,
-    pub ring: Vec<[u8; 32]>,
-    pub link: Option<LinkProof>,
-    pub range: Option<RangeProof>,
+    pub proof: Option<NoteProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactOutput {
-    pub one_time_dest: [u8; 32],
-    pub discovery_tag: [u8; 32],
+    pub dest: SpendPk,
+    pub eph_pk: [u8; 32],
+    pub diversifier: [u8; 16],
     pub value_commitment: ValueCommitment,
-    pub asset_id: [u8; 32],
-    pub range: Option<RangeProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,8 +33,8 @@ pub struct ActionBundle {
     pub version: u32,
     pub actions: Vec<CompactAction>,
     pub fee_commitment: ValueCommitment,
-    pub fee_range: Option<RangeProof>,
     pub binding: Option<BindingSig>,
+    pub emission: Option<EmissionOr>,
 }
 
 fn is_identity(c: &ValueCommitment) -> bool {
@@ -52,16 +48,13 @@ impl ActionBundle {
                 spend: Some(CompactSpend {
                     spend_tag: [0u8; 32],
                     rerand: ValueCommitment::identity(),
-                    ring: Vec::new(),
-                    link: None,
-                    range: None,
+                    proof: None,
                 }),
                 output: Some(CompactOutput {
-                    one_time_dest: [0u8; 32],
-                    discovery_tag: [0u8; 32],
+                    dest: SpendPk { bytes: [0u8; 32] },
+                    eph_pk: [0u8; 32],
+                    diversifier: [0u8; 16],
                     value_commitment: ValueCommitment::identity(),
-                    asset_id: [0u8; 32],
-                    range: None,
                 }),
             });
         }
@@ -80,7 +73,7 @@ impl ActionBundle {
         self.actions
             .iter()
             .filter_map(|a| a.spend.as_ref())
-            .filter(|s| s.spend_tag != [0u8; 32] && !is_identity(&s.rerand))
+            .filter(|s| s.spend_tag != [0u8; 32])
             .collect()
     }
 
@@ -125,70 +118,23 @@ impl ActionBundle {
             .collect()
     }
 
+    pub fn output_note_ids(&self) -> Vec<[u8; 32]> {
+        use super::keys::note_id;
+        use super::proof::asset_scalar;
+        self.real_outputs()
+            .into_iter()
+            .map(|o| note_id(&o.value_commitment.commitment, &o.dest, &asset_scalar(&[0u8; 32])))
+            .collect()
+    }
+
     pub fn spend_tags(&self) -> Vec<[u8; 32]> {
         self.real_spends()
             .into_iter()
             .map(|s| s.spend_tag)
             .collect()
     }
-}
 
-pub fn emission_blinding(dest: &[u8; 32], height: u64) -> Scalar {
-    let mut seed = b"hybrid-emission-v2".to_vec();
-    seed.extend_from_slice(dest);
-    seed.extend_from_slice(&height.to_le_bytes());
-    blinding_from_seed(&seed)
-}
-
-pub fn emission_commitment(dest: &[u8; 32], height: u64, reward: u64) -> ValueCommitment {
-    ValueCommitment::commit(
-        reward,
-        &emission_blinding(dest, height),
-        &PedersenGenerators::default(),
-    )
-}
-
-pub fn coinbase_bundle(
-    dest: [u8; 32],
-    shared_scan: &[u8],
-    value_commitment: ValueCommitment,
-    asset_id: [u8; 32],
-    range: RangeProof,
-) -> ActionBundle {
-    let tag = discovery_tag(shared_scan, 0);
-    ActionBundle {
-        version: 2,
-        actions: vec![CompactAction {
-            spend: None,
-            output: Some(CompactOutput {
-                one_time_dest: dest,
-                discovery_tag: tag,
-                value_commitment,
-                asset_id,
-                range: Some(range),
-            }),
-        }],
-        fee_commitment: ValueCommitment::identity(),
-        fee_range: None,
-        binding: None,
-    }
-    .pad_to(BUNDLE_PAD)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::notes::auth::RangeProof;
-
-    #[test]
-    fn emission_shape_is_padded() {
-        let dest = [7u8; 32];
-        let r = emission_blinding(&dest, 0);
-        let c = emission_commitment(&dest, 0, 50);
-        let range = RangeProof::prove(50, &r);
-        let b = coinbase_bundle(dest, b"scan", c, [0u8; 32], range);
-        assert_eq!(b.actions.len(), BUNDLE_PAD);
-        assert!(b.is_emission());
-        assert!(b.verify_conservation());
+    pub fn id(&self) -> [u8; 32] {
+        crate::consensus::pow::sha256d(&bincode::serialize(self).unwrap_or_default())
     }
 }
