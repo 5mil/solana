@@ -1,6 +1,7 @@
 use crate::chain::block::{Block, BlockType};
 use crate::chain::blockchain::Blockchain;
 use crate::consensus::pow::{meets_difficulty, sha256d};
+use crate::notes::action::emission_commitment;
 use crate::notes::launch::LaunchSet;
 use crate::notes::tags::SpendTagSet;
 use crate::notes::tree::NoteCommitmentTree;
@@ -118,16 +119,26 @@ impl Blockchain {
                     )));
                 }
                 let expected_reward = pow_reward_at_height(block.header.height);
-                let claimed = block
-                    .transactions
-                    .first()
-                    .and_then(|tx| tx.outputs.first())
-                    .map(|o| o.value)
-                    .unwrap_or(0);
-                if claimed != expected_reward {
+                let expected_c = emission_commitment(block.header.height, expected_reward).commitment;
+                let found = block.compact.iter().any(|b| {
+                    b.is_emission()
+                        && b.real_outputs()
+                            .iter()
+                            .any(|o| o.value_commitment.commitment == expected_c)
+                });
+                if !found {
                     return Err(StoreError::Invalid(format!(
-                        "reward mismatch at height {i}: claimed={claimed} expected={expected_reward}"
+                        "emission commitment mismatch at height {i}"
                     )));
+                }
+                for tx in &block.transactions {
+                    for o in &tx.outputs {
+                        if o.value != 0 {
+                            return Err(StoreError::Invalid(format!(
+                                "plaintext value forbidden at height {i}"
+                            )));
+                        }
+                    }
                 }
             }
             for bundle in &block.compact {
@@ -136,9 +147,13 @@ impl Blockchain {
                         "compact conservation failed at height {i}"
                     )));
                 }
-                crate::chain::blockchain::verify_bundle_against(&notes, &launch, bundle).map_err(
-                    |e| StoreError::Invalid(format!("compact verify at height {i}: {e}")),
-                )?;
+                crate::chain::blockchain::verify_bundle_against(
+                    &notes,
+                    &launch,
+                    bundle,
+                    bundle.is_emission(),
+                )
+                .map_err(|e| StoreError::Invalid(format!("compact verify at height {i}: {e}")))?;
                 for tag in bundle.spend_tags() {
                     tags.insert(tag).map_err(|e| {
                         StoreError::Invalid(format!("spend tag at height {i}: {e}"))
@@ -176,6 +191,7 @@ fn pow_reward_at_height(height: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notes::action::emission_blinding;
     use std::env;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -225,9 +241,7 @@ mod tests {
         let height = 1u64;
         let sealed = crate::notes::payout::SealedPayout::from_ticket(b"miner", height);
         let reward = CHAIN_PARAMS.pow_block_reward;
-        let in_blind = crate::notes::commitment::blinding_from_seed(
-            &[b"miner".as_ref(), &height.to_le_bytes()].concat(),
-        );
+        let in_blind = emission_blinding(height);
         let r_out = crate::notes::commitment::blinding_from_seed(b"wout");
         let r_fee = in_blind - r_out;
         let bundle = crate::notes::transfer_window_bundle(
@@ -285,11 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tampered_reward() {
+    fn rejects_plaintext_value() {
         let (_chain, path) = mined_chain();
         rewrite(&path, |snap| {
-            snap.blocks[1].transactions[0].outputs[0].value =
-                snap.blocks[1].transactions[0].outputs[0].value.saturating_mul(2);
+            snap.blocks[1].transactions[0].outputs[0].value = 99;
             snap.blocks[1].header.merkle_root =
                 Block::compute_merkle_root(&snap.blocks[1].transactions);
         });
