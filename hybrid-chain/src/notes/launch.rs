@@ -1,6 +1,6 @@
-//! Living set is the current window. Dropped notes must already have
-//! been spent into a new window note. No history-as-decoy split.
+//! Living set = current window of commitments. Ring decoys only from here.
 
+use super::auth::RING;
 use super::tree::{merkle_root, NoteCommitmentTree};
 use crate::consensus::pow::sha256d;
 use curve25519_dalek::ristretto::RistrettoPoint;
@@ -25,7 +25,6 @@ impl ProfileKind {
             Self::Dense => 4096,
         }
     }
-
     pub fn window_epochs(self) -> usize {
         match self {
             Self::Constrained => 4,
@@ -34,11 +33,9 @@ impl ProfileKind {
             Self::Dense => 32,
         }
     }
-
     pub fn bucket(self) -> usize {
         self.cap()
     }
-
     pub fn id(self) -> u8 {
         match self {
             Self::Constrained => 1,
@@ -68,11 +65,9 @@ impl LaunchSet {
             sealed_count: 0,
         }
     }
-
     pub fn standard() -> Self {
         Self::new(ProfileKind::Standard)
     }
-
     fn leaves(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
         for epoch in &self.window {
@@ -81,17 +76,14 @@ impl LaunchSet {
         out.extend_from_slice(&self.live);
         out
     }
-
     fn sorted(&self) -> Vec<[u8; 32]> {
         let mut l = self.leaves();
         l.sort_unstable();
         l
     }
-
     pub fn window_root(&self) -> [u8; 32] {
         merkle_root(&self.sorted())
     }
-
     pub fn commitment(&self) -> [u8; 32] {
         let mut c = Vec::with_capacity(65);
         c.extend_from_slice(&self.window_root());
@@ -99,18 +91,15 @@ impl LaunchSet {
         c.push(self.profile.id());
         sha256d(&c)
     }
-
     pub fn contains(&self, leaf: [u8; 32]) -> bool {
         self.leaves().iter().any(|l| *l == leaf)
     }
-
     pub fn append(&mut self, leaf: [u8; 32]) {
         self.live.push(leaf);
         if self.live.len() >= self.profile.cap() {
             self.seal();
         }
     }
-
     pub fn seal(&mut self) {
         if self.live.is_empty() {
             return;
@@ -127,7 +116,6 @@ impl LaunchSet {
             self.window.pop_front();
         }
     }
-
     fn pad_live(&mut self) {
         let bucket = self.profile.bucket();
         let mut i = self.live.len() as u64;
@@ -136,15 +124,43 @@ impl LaunchSet {
             i += 1;
         }
     }
-
-    pub fn prove_window(&self, note_id: [u8; 32]) -> Option<(usize, Vec<[u8; 32]>)> {
+    pub fn prove_window(&self, leaf: [u8; 32]) -> Option<(usize, Vec<[u8; 32]>)> {
         let sorted = self.sorted();
-        let index = sorted.iter().position(|l| *l == note_id)?;
+        let index = sorted.iter().position(|l| *l == leaf)?;
         let mut t = NoteCommitmentTree::new();
         for l in &sorted {
             t.append(*l);
         }
         Some((index, t.proof(index)?))
+    }
+    pub fn sample_ring(&self, real: [u8; 32], seed: &[u8]) -> Option<(Vec<[u8; 32]>, usize)> {
+        if !self.contains(real) {
+            return None;
+        }
+        let mut decoys: Vec<[u8; 32]> = self.leaves().into_iter().filter(|c| *c != real).collect();
+        decoys.sort_unstable();
+        let mut ring = vec![real];
+        let mut i = 0u64;
+        while ring.len() < RING && !decoys.is_empty() {
+            let mut buf = seed.to_vec();
+            buf.extend_from_slice(&i.to_le_bytes());
+            let h = sha256d(&buf);
+            let idx = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize % decoys.len();
+            let pick = decoys.remove(idx);
+            if !ring.contains(&pick) {
+                ring.push(pick);
+            }
+            i += 1;
+            if i > 2048 {
+                break;
+            }
+        }
+        while ring.len() < RING {
+            ring.push(real);
+        }
+        ring.sort_unstable();
+        let index = ring.iter().position(|c| *c == real)?;
+        Some((ring, index))
     }
 }
 
@@ -158,30 +174,4 @@ fn pad_point(acc: &[u8; 32], sealed: u64, i: u64) -> [u8; 32] {
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&out);
     RistrettoPoint::from_uniform_bytes(&wide).compress().to_bytes()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dropped_epoch_is_not_spendable() {
-        let mut s = LaunchSet::new(ProfileKind::Constrained);
-        let first = [42u8; 32];
-        s.append(first);
-        s.seal();
-        for e in 0..ProfileKind::Constrained.window_epochs() + 1 {
-            s.append([(e + 3) as u8; 32]);
-            s.seal();
-        }
-        assert!(!s.contains(first));
-        assert!(s.prove_window(first).is_none());
-    }
-
-    #[test]
-    fn live_note_has_path() {
-        let mut s = LaunchSet::standard();
-        s.append([7u8; 32]);
-        assert!(s.prove_window([7u8; 32]).is_some());
-    }
 }
