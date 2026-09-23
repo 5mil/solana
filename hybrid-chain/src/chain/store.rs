@@ -1,6 +1,7 @@
 use crate::chain::block::{Block, BlockType};
 use crate::chain::blockchain::Blockchain;
 use crate::consensus::pow::{meets_difficulty, sha256d};
+use crate::notes::launch::LaunchSet;
 use crate::notes::tags::SpendTagSet;
 use crate::notes::tree::NoteCommitmentTree;
 use crate::params::CHAIN_PARAMS;
@@ -59,6 +60,7 @@ impl Blockchain {
             current_difficulty: snap.current_difficulty,
             total_supply: snap.total_supply,
             notes: NoteCommitmentTree::new(),
+            launch: LaunchSet::standard(),
             tags: SpendTagSet::new(),
         };
         for (i, block) in snap.blocks.into_iter().enumerate() {
@@ -78,6 +80,7 @@ impl Blockchain {
             return Err(StoreError::Invalid("empty chain".into()));
         }
         let mut notes = NoteCommitmentTree::new();
+        let mut launch = LaunchSet::standard();
         let mut tags = SpendTagSet::new();
         for (i, block) in self.blocks.iter().enumerate() {
             if block.header.height != i as u64 {
@@ -133,6 +136,9 @@ impl Blockchain {
                         "compact conservation failed at height {i}"
                     )));
                 }
+                crate::chain::blockchain::verify_bundle_against(&notes, &launch, bundle).map_err(
+                    |e| StoreError::Invalid(format!("compact verify at height {i}: {e}")),
+                )?;
                 for tag in bundle.spend_tags() {
                     tags.insert(tag).map_err(|e| {
                         StoreError::Invalid(format!("spend tag at height {i}: {e}"))
@@ -140,6 +146,7 @@ impl Blockchain {
                 }
                 for c in bundle.output_commitments() {
                     notes.append(c);
+                    launch.append(c);
                 }
             }
             if block.header.notes_root != notes.root() {
@@ -207,7 +214,44 @@ mod tests {
         assert_eq!(loaded.height(), chain.height());
         assert_eq!(loaded.tip_hash(), chain.tip_hash());
         assert_eq!(loaded.height(), 2);
+        assert_eq!(loaded.launch.commitment(), chain.launch.commitment());
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn persist_after_hidden_spend_rebuilds_window() {
+        let mut chain = Blockchain::new();
+        let _ = chain.mine_pow_block("miner");
+        let height = 1u64;
+        let sealed = crate::notes::payout::SealedPayout::from_ticket(b"miner", height);
+        let reward = CHAIN_PARAMS.pow_block_reward;
+        let in_blind = crate::notes::commitment::blinding_from_seed(
+            &[b"miner".as_ref(), &height.to_le_bytes()].concat(),
+        );
+        let r_out = crate::notes::commitment::blinding_from_seed(b"wout");
+        let r_fee = in_blind - r_out;
+        let bundle = crate::notes::transfer_window_bundle(
+            &sealed.spend_secret(),
+            &chain.launch,
+            reward,
+            &in_blind,
+            [7u8; 32],
+            b"recv-scan",
+            reward - 1,
+            &r_out,
+            1,
+            &r_fee,
+            [0u8; 32],
+        )
+        .expect("window transfer");
+        let _ = chain.mine_pow_with_bundles("miner2", vec![bundle]);
+        let dir = isolated_path("hidden");
+        let path = dir.join("chain.bin");
+        chain.save_to_path(&path).expect("save");
+        let loaded = Blockchain::load_from_path(&path).expect("load hidden spend chain");
+        assert_eq!(loaded.height(), chain.height());
+        assert_eq!(loaded.launch.commitment(), chain.launch.commitment());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
