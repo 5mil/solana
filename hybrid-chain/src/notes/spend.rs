@@ -121,13 +121,13 @@ pub fn emission_bundle(
         d.copy_from_slice(&blinding_from_seed(&[b"pad-d".as_ref(), &height.to_le_bytes()]).to_bytes()[..16]);
         d
     };
+    let pad_eph_sk = blinding_from_seed(&[b"pad-eph".as_ref(), &pad_div]);
     let pad = CompactOutput {
         dest: pad_sk.pk(),
-        eph_pk: (blinding_from_seed(&[b"pad-eph".as_ref(), &pad_div]).to_bytes()),
+        eph_pk: (pad_eph_sk * RISTRETTO_BASEPOINT_POINT).compress().to_bytes(),
         diversifier: pad_div,
         value_commitment: commit_with_asset(0, &pad_r, &[0u8; 32]),
     };
-    // Slot chosen from dest bytes, not hard-coded 0.
     let real_first = dest_sk.pk().bytes[0] & 1 == 0;
     let (o0, o1, real_idx) = if real_first {
         (real, pad, 0usize)
