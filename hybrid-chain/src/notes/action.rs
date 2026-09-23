@@ -1,7 +1,11 @@
-//! Dummy-padded compact actions. Conservation is required except coinbase.
+//! Dummy-padded compact actions. Transfers conserve. Emission is a no-spend bundle.
+//!
+//! Consensus treats identity commitments as padding. The `dummy` / `coinbase`
+//! flags are not an escape hatch.
 
-use super::commitment::{verify_balance, ValueCommitment};
+use super::commitment::{blinding_from_seed, verify_balance, PedersenGenerators, ValueCommitment};
 use super::payout::discovery_tag;
+use curve25519_dalek::scalar::Scalar;
 use serde::{Deserialize, Serialize};
 
 pub const BUNDLE_PAD: usize = 2;
@@ -40,6 +44,10 @@ pub struct ActionBundle {
     pub coinbase: bool,
 }
 
+fn is_identity(c: &ValueCommitment) -> bool {
+    c.commitment == ValueCommitment::identity().commitment
+}
+
 impl ActionBundle {
     pub fn pad_to(mut self, n: usize) -> Self {
         while self.actions.len() < n {
@@ -69,7 +77,7 @@ impl ActionBundle {
         self.actions
             .iter()
             .filter_map(|a| a.output.as_ref())
-            .filter(|o| !o.dummy)
+            .filter(|o| !is_identity(&o.value_commitment))
             .collect()
     }
 
@@ -77,8 +85,12 @@ impl ActionBundle {
         self.actions
             .iter()
             .filter_map(|a| a.spend.as_ref())
-            .filter(|s| !s.dummy)
+            .filter(|s| !is_identity(&s.value_commitment) && s.spend_tag != [0u8; 32])
             .collect()
+    }
+
+    pub fn is_emission(&self) -> bool {
+        self.real_spends().is_empty() && !self.real_outputs().is_empty()
     }
 
     pub fn verify_conservation(&self) -> bool {
@@ -92,11 +104,8 @@ impl ActionBundle {
             .into_iter()
             .map(|o| o.value_commitment.clone())
             .collect();
-        if self.coinbase {
-            return inputs.is_empty();
-        }
         if inputs.is_empty() {
-            return false;
+            return !outputs.is_empty() && is_identity(&self.fee_commitment);
         }
         verify_balance(&inputs, &outputs, &self.fee_commitment)
     }
@@ -114,6 +123,17 @@ impl ActionBundle {
             .map(|s| s.spend_tag)
             .collect()
     }
+}
+
+/// Schedule-openable blinding. Amount is implied by height; dest is not.
+pub fn emission_blinding(height: u64) -> Scalar {
+    let mut seed = b"hybrid-emission-v1".to_vec();
+    seed.extend_from_slice(&height.to_le_bytes());
+    blinding_from_seed(&seed)
+}
+
+pub fn emission_commitment(height: u64, reward: u64) -> ValueCommitment {
+    ValueCommitment::commit(reward, &emission_blinding(height), &PedersenGenerators::default())
 }
 
 pub fn coinbase_bundle(
@@ -136,7 +156,7 @@ pub fn coinbase_bundle(
             }),
         }],
         fee_commitment: ValueCommitment::identity(),
-        coinbase: true,
+        coinbase: false,
     }
     .pad_to(BUNDLE_PAD)
 }
@@ -144,17 +164,26 @@ pub fn coinbase_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
 
     #[test]
-    fn coinbase_is_padded_and_conserves_shape() {
-        let gens = PedersenGenerators::default();
-        let r = blinding_from_seed(b"cb");
-        let c = ValueCommitment::commit(50, &r, &gens);
+    fn emission_is_padded_and_has_emission_shape() {
+        let c = emission_commitment(0, 50);
         let b = coinbase_bundle([7u8; 32], b"scan", c, [0u8; 32]);
         assert_eq!(b.actions.len(), BUNDLE_PAD);
         assert!(b.verify_conservation());
+        assert!(b.is_emission());
         assert_eq!(b.real_outputs().len(), 1);
+        assert!(b.real_spends().is_empty());
+        assert!(!b.coinbase);
+    }
+
+    #[test]
+    fn identity_padding_is_not_a_real_spend() {
+        let c = emission_commitment(1, 10);
+        let b = coinbase_bundle([1u8; 32], b"s", c, [0u8; 32]);
+        assert!(b.actions.iter().any(|a| {
+            a.spend.as_ref().map(|s| s.dummy).unwrap_or(false)
+        }));
         assert!(b.real_spends().is_empty());
     }
 }
