@@ -1,80 +1,19 @@
-//! Construct a conserved transfer: one real spend + one real output + fee.
+//! The only legal user spend: nullifier, rerandomized C′, ring, range, binding.
 
 use super::action::{
     ActionBundle, CompactAction, CompactOutput, CompactSpend, BUNDLE_PAD,
 };
-use super::commitment::{PedersenGenerators, ValueCommitment};
+use super::auth::{rerand, BindingSig, LinkProof, RangeProof};
+use super::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
 use super::launch::LaunchSet;
-use super::membership::MembershipProof;
 use super::payout::discovery_tag;
 use super::tags::SpendTagSet;
-use super::tree::NoteCommitmentTree;
 use curve25519_dalek::scalar::Scalar;
 
-pub fn transfer_bundle(
-    spend_secret: &[u8; 32],
-    tree: &NoteCommitmentTree,
-    leaf_index: usize,
-    in_value: u64,
-    in_blind: &Scalar,
-    out_dest: [u8; 32],
-    out_scan: &[u8],
-    out_value: u64,
-    out_blind: &Scalar,
-    fee_value: u64,
-    fee_blind: &Scalar,
-    asset_id: [u8; 32],
-) -> Result<ActionBundle, &'static str> {
-    if in_value != out_value.saturating_add(fee_value) {
-        return Err("plaintext values do not conserve");
-    }
-    let proof = MembershipProof::prove(tree, leaf_index).ok_or("leaf not in tree")?;
-    let gens = PedersenGenerators::default();
-    let in_c = ValueCommitment::commit(in_value, in_blind, &gens);
-    if in_c.commitment != proof.leaf {
-        return Err("commitment does not match tree leaf");
-    }
-    if !proof.verify(tree.root()) {
-        return Err("membership failed");
-    }
-    let tag = SpendTagSet::derive(spend_secret, &proof.leaf);
-    let out_c = ValueCommitment::commit(out_value, out_blind, &gens);
-    let fee_c = ValueCommitment::commit(fee_value, fee_blind, &gens);
-    let bundle = ActionBundle {
-        version: 1,
-        actions: vec![CompactAction {
-            spend: Some(CompactSpend {
-                prev_txid: [0u8; 32],
-                prev_vout: 0,
-                spend_tag: tag,
-                value_commitment: in_c,
-                dummy: false,
-                membership: Some(proof),
-                hidden: None,
-            }),
-            output: Some(CompactOutput {
-                one_time_dest: out_dest,
-                discovery_tag: discovery_tag(out_scan, 0),
-                value_commitment: out_c,
-                dummy: false,
-                asset_id,
-            }),
-        }],
-        fee_commitment: fee_c,
-        coinbase: false,
-    }
-    .pad_to(BUNDLE_PAD);
-    if !bundle.verify_conservation() {
-        return Err("homomorphic conservation failed");
-    }
-    Ok(bundle)
-}
-
-/// Launch spend: membership is a HiddenProof against the sorted window.
-/// No epoch_index / epoch_root on the bundle.
 pub fn transfer_window_bundle(
     spend_secret: &[u8; 32],
     set: &LaunchSet,
+    note_cm: [u8; 32],
     in_value: u64,
     in_blind: &Scalar,
     out_dest: [u8; 32],
@@ -89,36 +28,52 @@ pub fn transfer_window_bundle(
         return Err("plaintext values do not conserve");
     }
     let gens = PedersenGenerators::default();
-    let in_c = ValueCommitment::commit(in_value, in_blind, &gens);
-    let hidden = set.prove(in_c.commitment).ok_or("leaf not in window")?;
-    if !hidden.verify(set.window_root()) {
-        return Err("hidden membership failed");
+    let note = ValueCommitment {
+        commitment: note_cm,
+    };
+    let expected = ValueCommitment::commit(in_value, in_blind, &gens);
+    if expected.commitment != note_cm {
+        return Err("note opening does not match commitment");
     }
-    let tag = SpendTagSet::derive(spend_secret, &hidden.leaf);
+    let delta = blinding_from_seed(&[b"rerand".as_ref(), spend_secret, &note_cm].concat());
+    let c_prime = rerand(&note, &delta);
+    let (ring, idx) = set.sample_ring(note_cm, spend_secret).ok_or("leaf not spendable")?;
+    let link = LinkProof::prove(&ring, idx, &delta, &c_prime);
+    if !link.verify(&ring, &c_prime) {
+        return Err("link failed");
+    }
+    let tag = SpendTagSet::derive(spend_secret, &note_cm);
     let out_c = ValueCommitment::commit(out_value, out_blind, &gens);
     let fee_c = ValueCommitment::commit(fee_value, fee_blind, &gens);
+    let out_range = RangeProof::prove(out_value, out_blind);
+    let fee_range = RangeProof::prove(fee_value, fee_blind);
+    let in_range = RangeProof::prove(in_value, &(in_blind + delta));
+    let r_bind = (*in_blind + delta) - *out_blind - *fee_blind;
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(&tag);
+    transcript.extend_from_slice(&out_c.commitment);
+    let binding = BindingSig::sign(&r_bind, &transcript);
     let bundle = ActionBundle {
-        version: 1,
+        version: 2,
         actions: vec![CompactAction {
             spend: Some(CompactSpend {
-                prev_txid: [0u8; 32],
-                prev_vout: 0,
                 spend_tag: tag,
-                value_commitment: in_c,
-                dummy: false,
-                membership: None,
-                hidden: Some(hidden),
+                rerand: c_prime,
+                ring,
+                link: Some(link),
+                range: Some(in_range),
             }),
             output: Some(CompactOutput {
                 one_time_dest: out_dest,
                 discovery_tag: discovery_tag(out_scan, 0),
                 value_commitment: out_c,
-                dummy: false,
                 asset_id,
+                range: Some(out_range),
             }),
         }],
         fee_commitment: fee_c,
-        coinbase: false,
+        fee_range: Some(fee_range),
+        binding: Some(binding),
     }
     .pad_to(BUNDLE_PAD);
     if !bundle.verify_conservation() {
@@ -132,50 +87,30 @@ mod tests {
     use super::*;
     use crate::notes::commitment::blinding_from_seed;
     use crate::notes::launch::ProfileKind;
-    use crate::notes::tree::NoteCommitmentTree;
 
     #[test]
-    fn transfer_conserves_and_proves() {
-        let gens = PedersenGenerators::default();
-        let r_in = blinding_from_seed(b"in");
-        let leaf = ValueCommitment::commit(100, &r_in, &gens).commitment;
-        let mut tree = NoteCommitmentTree::new();
-        tree.append(leaf);
-        let r_out = blinding_from_seed(b"out");
-        let r_fee = r_in - r_out;
-        let b = transfer_bundle(
-            &[9u8; 32],
-            &tree,
-            0,
-            100,
-            &r_in,
-            [3u8; 32],
-            b"scan",
-            90,
-            &r_out,
-            10,
-            &r_fee,
-            [0u8; 32],
-        )
-        .expect("bundle");
-        assert!(!b.coinbase);
-        assert!(b.verify_conservation());
-        assert_eq!(b.real_spends().len(), 1);
-        assert_eq!(b.actions.len(), BUNDLE_PAD);
-    }
-
-    #[test]
-    fn window_transfer_hides_epoch_and_conserves() {
+    fn spend_does_not_publish_note_cm_as_rerand() {
         let gens = PedersenGenerators::default();
         let r_in = blinding_from_seed(b"win");
-        let leaf = ValueCommitment::commit(40, &r_in, &gens).commitment;
+        let note = ValueCommitment::commit(40, &r_in, &gens);
         let mut set = LaunchSet::new(ProfileKind::Constrained);
-        set.append(leaf);
+        set.append(note.commitment);
+        for i in 1..16u8 {
+            set.append([i; 32]);
+        }
+        let r_out = blinding_from_seed(b"wout");
+        let r_fee = r_in - r_out;
+        // fee_blind for binding uses in_blind+delta - out - fee, constructor
+        // takes fee_blind separately; use r_in - r_out as fee value blind only
+        // if delta is added inside. Conservation of values 40=30+10.
+        let r_fee = blinding_from_seed(b"fee");
+        let r_out = r_in - r_fee; // may fail conservation of blinds vs values
         let r_out = blinding_from_seed(b"wout");
         let r_fee = r_in - r_out;
         let b = transfer_window_bundle(
             &[8u8; 32],
             &set,
+            note.commitment,
             40,
             &r_in,
             [4u8; 32],
@@ -188,32 +123,9 @@ mod tests {
         )
         .expect("window bundle");
         let spend = b.real_spends()[0];
-        assert!(spend.membership.is_none());
-        assert!(spend.hidden.is_some());
-        assert!(spend.hidden.as_ref().unwrap().verify(set.window_root()));
+        assert_ne!(spend.rerand.commitment, note.commitment);
+        assert_eq!(spend.ring.len(), crate::notes::auth::RING);
+        assert!(spend.link.is_some());
         assert!(b.verify_conservation());
-    }
-
-    #[test]
-    fn rejects_value_mismatch() {
-        let gens = PedersenGenerators::default();
-        let r = blinding_from_seed(b"in");
-        let mut tree = NoteCommitmentTree::new();
-        tree.append(ValueCommitment::commit(50, &r, &gens).commitment);
-        let err = transfer_bundle(
-            &[1u8; 32],
-            &tree,
-            0,
-            50,
-            &r,
-            [1u8; 32],
-            b"s",
-            50,
-            &r,
-            10,
-            &r,
-            [0u8; 32],
-        );
-        assert!(err.is_err());
     }
 }
