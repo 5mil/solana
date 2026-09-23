@@ -26,30 +26,29 @@ pub struct BlockHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
-    pub transactions: Vec<crate::chain::transaction::Transaction>,
     pub compact: Vec<ActionBundle>,
 }
 
 impl Block {
     pub fn hash(&self) -> [u8; 32] {
-        let header_bytes = bincode::serialize(&self.header).unwrap_or_default();
-        sha256d(&header_bytes)
+        sha256d(&bincode::serialize(&self.header).unwrap_or_default())
     }
 
-    pub fn compute_merkle_root(txs: &[crate::chain::transaction::Transaction]) -> [u8; 32] {
-        if txs.is_empty() {
+    pub fn compute_merkle_root(bundles: &[ActionBundle]) -> [u8; 32] {
+        if bundles.is_empty() {
             return [0u8; 32];
         }
-        let mut hashes: Vec<[u8; 32]> = txs.iter().map(|tx| tx.txid()).collect();
+        let mut hashes: Vec<[u8; 32]> = bundles.iter().map(|b| b.id()).collect();
         while hashes.len() > 1 {
             if hashes.len() % 2 != 0 {
                 hashes.push(*hashes.last().unwrap());
             }
-            hashes = hashes.chunks(2)
+            hashes = hashes
+                .chunks(2)
                 .map(|pair| {
-                    let mut combined = pair[0].to_vec();
-                    combined.extend_from_slice(&pair[1]);
-                    sha256d(&combined)
+                    let mut c = pair[0].to_vec();
+                    c.extend_from_slice(&pair[1]);
+                    sha256d(&c)
                 })
                 .collect();
         }
