@@ -1,4 +1,4 @@
-//! One action type. No listed ring. Dest is a spend pubkey.
+//! One action type. Dest lives on outputs only.
 
 use super::commitment::{verify_balance, ValueCommitment};
 use super::keys::SpendPk;
@@ -115,15 +115,6 @@ impl ActionBundle {
         self.real_outputs()
             .into_iter()
             .map(|o| o.value_commitment.commitment)
-            .collect()
-    }
-
-    pub fn output_note_ids(&self) -> Vec<[u8; 32]> {
-        use super::keys::note_id;
-        use super::proof::asset_scalar;
-        self.real_outputs()
-            .into_iter()
-            .map(|o| note_id(&o.value_commitment.commitment, &o.dest, &asset_scalar(&[0u8; 32])))
             .collect()
     }
 
