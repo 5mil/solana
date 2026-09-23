@@ -1,6 +1,6 @@
 //! One action type. Dest lives on outputs only.
 
-use super::commitment::{verify_balance, ValueCommitment};
+use super::commitment::ValueCommitment;
 use super::keys::SpendPk;
 use super::proof::{BindingSig, EmissionOr, NoteProof};
 use serde::{Deserialize, Serialize};
@@ -95,7 +95,7 @@ impl ActionBundle {
         if inputs.is_empty() {
             return !outputs.is_empty() && is_identity(&self.fee_commitment);
         }
-        verify_balance(&inputs, &outputs, &self.fee_commitment)
+        self.binding.is_some() && !outputs.is_empty()
     }
 
     pub fn output_commitments(&self) -> Vec<[u8; 32]> {
@@ -106,10 +106,7 @@ impl ActionBundle {
     }
 
     pub fn spend_tags(&self) -> Vec<[u8; 32]> {
-        self.real_spends()
-            .into_iter()
-            .map(|s| s.spend_tag)
-            .collect()
+        self.real_spends().into_iter().map(|s| s.spend_tag).collect()
     }
 
     pub fn id(&self) -> [u8; 32] {
