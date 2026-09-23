@@ -21,11 +21,7 @@ impl StemPath {
             hops_out.push(cur);
         }
         let fluff_peer = *hops_out.last().unwrap();
-        Self {
-            origin,
-            hops: hops_out,
-            fluff_peer,
-        }
+        Self { origin, hops: hops_out, fluff_peer }
     }
 }
 
@@ -48,24 +44,15 @@ fn bundle_id(bundle: &ActionBundle) -> [u8; 32] {
 }
 
 impl RelayNet {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
     pub fn ingest_stem(&mut self, secret: &[u8], bundle: ActionBundle, hops: usize) {
         let id = bundle_id(&bundle);
-        if self.seen.contains_key(&id) {
-            return;
-        }
+        if self.seen.contains_key(&id) { return; }
         self.seen.insert(id, ());
-        self.stem.push_back(StemItem {
-            bundle,
-            hop: 0,
-            path: StemPath::from_secret(secret, hops),
-        });
+        self.stem.push_back(StemItem { bundle, hop: 0, path: StemPath::from_secret(secret, hops) });
     }
 
-    /// Advance one hop. After the stem, the bundle is fluffed (broadcast).
     pub fn tick(&mut self) -> Vec<ActionBundle> {
         let mut fluffed = Vec::new();
         let mut next = VecDeque::new();
@@ -82,28 +69,21 @@ impl RelayNet {
         fluffed
     }
 
-    pub fn fluff_pool(&self) -> &[ActionBundle] {
-        &self.fluff
-    }
-
-    pub fn stemming(&self) -> usize {
-        self.stem.len()
-    }
+    pub fn fluff_pool(&self) -> &[ActionBundle] { &self.fluff }
+    pub fn stemming(&self) -> usize { self.stem.len() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notes::action::coinbase_bundle;
-    use crate::notes::action::{emission_blinding, emission_commitment};
-    use crate::notes::auth::RangeProof;
+    use crate::notes::keys::{ScanKey, SpendKey};
+    use crate::notes::spend::emission_bundle;
 
     #[test]
     fn stem_then_fluff_does_not_expose_origin_as_first_peer() {
-        let dest = [1u8; 32];
-        let r = emission_blinding(&dest, 0);
-        let c = emission_commitment(&dest, 0, 5);
-        let b = coinbase_bundle(dest, b"s", c, [0u8; 32], RangeProof::prove(5, &r));
+        let sk = SpendKey::from_wallet_seed(b"relay-w");
+        let scan = ScanKey::from_wallet_seed(b"relay-s");
+        let b = emission_bundle(&sk, &scan, 0, 5, [1u8; 16]);
         let path = StemPath::from_secret(b"wallet-1", 3);
         assert_ne!(path.hops[0], path.origin);
         let mut net = RelayNet::new();
