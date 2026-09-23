@@ -1,40 +1,18 @@
 # Compact notes on hybrid-chain (`dev`)
 
-Production-path increment. Reward amounts remain on the classic coinbase for schedule checks; dest is sealed bytes, not a worker label.
+Privacy is the only legal path. Consensus rejects the old exits.
 
-## On this branch
+## Forced by algebra / validation
 
-- Ristretto Pedersen + homomorphic conservation
-- Dummy-padded ActionBundle (pad=2)
-- Coinbase / coinstake dest = sealed one-time bytes
-- Note Merkle tree + header.notes_root
-- Spend-tag set + header.tags_root
-- Real spend with membership path (not a decoy list)
-- Duplicate spend tag refused
-- Compact scan index by discovery tag
-- Stem/fluff first-hop model (lab)
-- Stake proof binds a committed note
-- Pool stores ticket_hash, not dest
-- Persist rebuilds tree+tags and refuses flipped leaves / roots / bad membership
-- Bounded-epoch forest (`epoch.rs`)
-- Launch set on the node (`Blockchain.launch`)
+- Classic `TxOutput.value` must be 0. Persist refuses any plaintext amount.
+- Spends must carry `HiddenProof`. `MembershipProof` on a real spend is `membership path forbidden`.
+- Emission is a no-spend padded bundle. Extra emission in user space is rejected.
+- PoW reward is checked as `Commit(schedule(height), emission_blinding(height))`, not a visible number.
+- Real vs pad is identity commitment / zero tag, not a trusted `dummy` flag.
+- Window membership: leaf must be in `LaunchSet` or the spend dies.
 
-## Five-step cutover (this increment)
+## Still on the wire (not an opt-out, still a leak to close)
 
-1. `Blockchain.launch: LaunchSet` — every compact output is appended to the window.
-2. `verify_bundle_against` accepts `HiddenProof` against `window_root`.
-3. `rebuild_notes` + persist load replay the launch set; commitment must match.
-4. Spends whose leaf is not in the window are refused (`spend outside window`).
-5. Tests: hidden spend + mine, replay refused, persist after hidden spend, out-of-window prove is `None`.
-
-`header.notes_root` is still the live-tree root so existing snapshots keep their formula.
-
-## Still not production-complete
-
-- Halo 2 / zk-token-sdk range circuits (path sides still sit on the wire)
-- Live P2P Dandelion++
-- Magister credential coordinator
-- Cashu mint
-- Hardware signing
-- Explorer-visible amounts fully gone
-- coinbase bool still a bundle fingerprint
+- Merkle path side bits
+- `dummy` / `coinbase` fields exist on the struct but are ignored by verification
+- Range proofs not yet in-circuit
