@@ -1,20 +1,12 @@
-//! Launch membership: hidden window, adaptive fill, folded accumulator.
-//!
-//! 1. Hide the epoch. Spends prove membership in the *sorted* window
-//!    (last W sealed epochs + live). Sort order is not time order, so the
-//!    path rank does not name an epoch. epoch_index / epoch_root stay off
-//!    the wire.
-//! 2. Keep epochs populated. Seal pads to a profile bucket with
-//!    deterministic dummy leaves so sparse and dense networks produce
-//!    the same-shaped epochs. Coinbase already stay-in-tree.
-//! 3. Fold. Each seal updates a 32-byte accumulator. Header commitment
-//!    is H(window_root || forest_acc). Verify is constant-size. Notes that
-//!    fall out of the window must refresh into live — that is how we stay
-//!    bounded past any chain length.
+//! Living set: sorted window for decoys, full history stays spendable.
+//! Pads are uniform Ristretto points with no known opening.
 
-use super::tree::{merkle_root, NoteCommitmentTree};
+use super::auth::RING;
+use super::tree::merkle_root;
 use crate::consensus::pow::sha256d;
+use curve25519_dalek::ristretto::RistrettoPoint;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 use std::collections::VecDeque;
 
 pub const WINDOW_DEPTH: usize = 20;
@@ -50,57 +42,13 @@ impl ProfileKind {
         self.cap()
     }
 
-    pub fn window_leaf_budget(self) -> usize {
-        self.window_epochs() * self.bucket() + self.cap()
-    }
-
-    pub fn recommend(notes_per_hour: u64, ram_mb: u32) -> Self {
-        if ram_mb < 64 || notes_per_hour < 16 {
-            return Self::Constrained;
+    pub fn id(self) -> u8 {
+        match self {
+            Self::Constrained => 1,
+            Self::Sparse => 2,
+            Self::Standard => 3,
+            Self::Dense => 4,
         }
-        if ram_mb < 256 || notes_per_hour < 256 {
-            return Self::Sparse;
-        }
-        if ram_mb < 1024 || notes_per_hour < 4096 {
-            return Self::Standard;
-        }
-        Self::Dense
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HiddenProof {
-    pub leaf: [u8; 32],
-    pub sides: u32,
-    pub siblings: [[u8; 32]; WINDOW_DEPTH],
-    pub used: u8,
-}
-
-impl HiddenProof {
-    pub fn size_bytes() -> usize {
-        32 + 4 + WINDOW_DEPTH * 32 + 1
-    }
-
-    pub fn verify(&self, window_root: [u8; 32]) -> bool {
-        if self.used as usize > WINDOW_DEPTH {
-            return false;
-        }
-        let mut hash = self.leaf;
-        let mut sides = self.sides;
-        for i in 0..self.used as usize {
-            let sib = self.siblings[i];
-            let mut c = Vec::with_capacity(64);
-            if sides & 1 == 0 {
-                c.extend_from_slice(&hash);
-                c.extend_from_slice(&sib);
-            } else {
-                c.extend_from_slice(&sib);
-                c.extend_from_slice(&hash);
-            }
-            hash = sha256d(&c);
-            sides >>= 1;
-        }
-        hash == window_root
     }
 }
 
@@ -109,6 +57,7 @@ pub struct LaunchSet {
     pub profile: ProfileKind,
     live: Vec<[u8; 32]>,
     window: VecDeque<Vec<[u8; 32]>>,
+    history: Vec<[u8; 32]>,
     forest_acc: [u8; 32],
     sealed_count: u64,
 }
@@ -119,6 +68,7 @@ impl LaunchSet {
             profile,
             live: Vec::new(),
             window: VecDeque::new(),
+            history: Vec::new(),
             forest_acc: [0u8; 32],
             sealed_count: 0,
         }
@@ -140,11 +90,7 @@ impl LaunchSet {
         self.forest_acc
     }
 
-    pub fn window_epoch_count(&self) -> usize {
-        self.window.len()
-    }
-
-    fn window_leaves_unsorted(&self) -> Vec<[u8; 32]> {
+    fn decoys(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
         for epoch in &self.window {
             out.extend_from_slice(epoch);
@@ -154,7 +100,7 @@ impl LaunchSet {
     }
 
     fn sorted_window(&self) -> Vec<[u8; 32]> {
-        let mut leaves = self.window_leaves_unsorted();
+        let mut leaves = self.decoys();
         leaves.sort_unstable();
         leaves
     }
@@ -164,18 +110,20 @@ impl LaunchSet {
     }
 
     pub fn commitment(&self) -> [u8; 32] {
-        let mut c = Vec::with_capacity(64);
+        let mut c = Vec::with_capacity(65);
         c.extend_from_slice(&self.window_root());
         c.extend_from_slice(&self.forest_acc);
+        c.push(self.profile.id());
         sha256d(&c)
     }
 
     pub fn contains(&self, leaf: [u8; 32]) -> bool {
-        self.window_leaves_unsorted().iter().any(|l| *l == leaf)
+        self.history.iter().any(|l| *l == leaf) || self.live.iter().any(|l| *l == leaf)
     }
 
     pub fn append(&mut self, leaf: [u8; 32]) {
         self.live.push(leaf);
+        self.history.push(leaf);
         if self.live.len() >= self.profile.cap() {
             self.seal();
         }
@@ -202,80 +150,65 @@ impl LaunchSet {
         let bucket = self.profile.bucket();
         let mut i = self.live.len() as u64;
         while self.live.len() < bucket {
-            let mut buf = Vec::with_capacity(48);
-            buf.extend_from_slice(b"epoch-pad");
-            buf.extend_from_slice(&self.forest_acc);
-            buf.extend_from_slice(&self.sealed_count.to_le_bytes());
-            buf.extend_from_slice(&i.to_le_bytes());
-            self.live.push(sha256d(&buf));
+            let p = pad_point(&self.forest_acc, self.sealed_count, i);
+            self.live.push(p);
+            self.history.push(p);
             i += 1;
         }
     }
 
-    pub fn prove(&self, leaf: [u8; 32]) -> Option<HiddenProof> {
-        let sorted = self.sorted_window();
-        let index = sorted.iter().position(|l| *l == leaf)?;
-        let raw = path_with_sides(&sorted, index)?;
-        let mut siblings = [[0u8; 32]; WINDOW_DEPTH];
-        let used = raw.1.len().min(WINDOW_DEPTH);
-        for (i, s) in raw.1.iter().take(used).enumerate() {
-            siblings[i] = *s;
+    /// Deterministic ring: real cm plus decoys from the living window.
+    /// Archive notes stay spendable (history) without a refresh holiday.
+    pub fn sample_ring(&self, real: [u8; 32], seed: &[u8]) -> Option<(Vec<[u8; 32]>, usize)> {
+        if !self.contains(real) {
+            return None;
         }
-        Some(HiddenProof {
-            leaf,
-            sides: raw.0,
-            siblings,
-            used: used as u8,
-        })
-    }
-}
-
-fn path_with_sides(leaves: &[[u8; 32]], mut index: usize) -> Option<(u32, Vec<[u8; 32]>)> {
-    if leaves.is_empty() || index >= leaves.len() {
-        return None;
-    }
-    let mut hashes = leaves.to_vec();
-    let mut siblings = Vec::new();
-    let mut sides = 0u32;
-    let mut bit = 0;
-    while hashes.len() > 1 {
-        if hashes.len() % 2 != 0 {
-            hashes.push(*hashes.last().unwrap());
-        }
-        if index % 2 == 1 {
-            sides |= 1 << bit;
-            siblings.push(hashes[index - 1]);
-        } else {
-            siblings.push(hashes[index + 1]);
-        }
-        hashes = hashes
-            .chunks(2)
-            .map(|pair| {
-                let mut c = pair[0].to_vec();
-                c.extend_from_slice(&pair[1]);
-                sha256d(&c)
-            })
+        let mut decoys: Vec<[u8; 32]> = self
+            .decoys()
+            .into_iter()
+            .filter(|c| *c != real)
             .collect();
-        index /= 2;
-        bit += 1;
-        if bit >= 32 {
-            break;
+        decoys.sort_unstable();
+        let mut ring = Vec::with_capacity(RING);
+        ring.push(real);
+        let mut i = 0u64;
+        while ring.len() < RING && !decoys.is_empty() {
+            let mut buf = seed.to_vec();
+            buf.extend_from_slice(&i.to_le_bytes());
+            let h = sha256d(&buf);
+            let idx = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize % decoys.len();
+            let pick = decoys.remove(idx);
+            if !ring.contains(&pick) {
+                ring.push(pick);
+            }
+            i += 1;
+            if i > 1024 {
+                break;
+            }
         }
+        while ring.len() < RING {
+            ring.push(real);
+        }
+        ring.sort_unstable();
+        let index = ring.iter().position(|c| *c == real)?;
+        Some((ring, index))
     }
-    Some((sides, siblings))
 }
 
-pub fn needs_refresh(set: &LaunchSet, leaf: [u8; 32]) -> bool {
-    !set.contains(leaf)
+fn pad_point(acc: &[u8; 32], sealed: u64, i: u64) -> [u8; 32] {
+    let mut h = Sha512::new();
+    h.update(b"epoch-pad-point");
+    h.update(acc);
+    h.update(&sealed.to_le_bytes());
+    h.update(&i.to_le_bytes());
+    let out = h.finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&out);
+    RistrettoPoint::from_uniform_bytes(&wide).compress().to_bytes()
 }
 
-#[allow(dead_code)]
-fn _tree_compat(leaves: &[[u8; 32]]) -> NoteCommitmentTree {
-    let mut t = NoteCommitmentTree::new();
-    for l in leaves {
-        t.append(*l);
-    }
-    t
+pub fn needs_refresh(_set: &LaunchSet, _leaf: [u8; 32]) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -283,77 +216,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_proof_has_no_epoch_fields_and_fixed_size() {
-        assert_eq!(HiddenProof::size_bytes(), 32 + 4 + 20 * 32 + 1);
-        let mut s = LaunchSet::new(ProfileKind::Constrained);
-        s.append([7u8; 32]);
-        s.append([3u8; 32]);
-        let p = s.prove([7u8; 32]).unwrap();
-        assert!(p.verify(s.window_root()));
-        let encoded = format!("{p:?}");
-        assert!(!encoded.contains("epoch_index"));
-        assert!(!encoded.contains("epoch_root"));
+    fn pads_are_curve_points() {
+        let p = pad_point(&[7u8; 32], 0, 1);
+        assert!(curve25519_dalek::ristretto::CompressedRistretto(p)
+            .decompress()
+            .is_some());
     }
 
     #[test]
-    fn sort_hides_insertion_order() {
-        let mut s = LaunchSet::new(ProfileKind::Constrained);
-        s.append([9u8; 32]);
-        s.append([1u8; 32]);
-        s.append([5u8; 32]);
-        let p = s.prove([9u8; 32]).unwrap();
-        assert!(p.verify(s.window_root()));
-    }
-
-    #[test]
-    fn seal_pads_and_folds_constant_acc() {
-        let mut s = LaunchSet::new(ProfileKind::Constrained);
-        s.append([1u8; 32]);
-        s.seal();
-        assert_eq!(s.sealed_count(), 1);
-        assert_eq!(s.live_len(), 0);
-        assert_ne!(s.forest_acc(), [0u8; 32]);
-        assert_eq!(s.commitment().len(), 32);
-        assert_eq!(
-            s.window.back().unwrap().len(),
-            ProfileKind::Constrained.bucket()
-        );
-    }
-
-    #[test]
-    fn dropped_epoch_requires_refresh() {
+    fn history_survives_window_roll() {
         let mut s = LaunchSet::new(ProfileKind::Constrained);
         let first = [42u8; 32];
         s.append(first);
         s.seal();
-        for e in 0..ProfileKind::Constrained.window_epochs() {
-            s.append([(e + 2) as u8; 32]);
+        for e in 0..ProfileKind::Constrained.window_epochs() + 2 {
+            s.append([(e + 3) as u8; 32]);
             s.seal();
         }
-        assert!(needs_refresh(&s, first));
-        assert!(!s.contains(first));
+        assert!(s.contains(first));
+        assert!(!needs_refresh(&s, first));
+        let (ring, idx) = s.sample_ring(first, b"seed").unwrap();
+        assert_eq!(ring.len(), RING);
+        assert_eq!(ring[idx], first);
     }
 
     #[test]
-    fn recommend_adapts_to_conditions() {
-        assert_eq!(ProfileKind::recommend(1, 16), ProfileKind::Constrained);
-        assert_eq!(ProfileKind::recommend(100, 128), ProfileKind::Sparse);
-        assert_eq!(ProfileKind::recommend(1000, 512), ProfileKind::Standard);
-        assert_eq!(ProfileKind::recommend(10_000, 4096), ProfileKind::Dense);
-    }
-
-    #[test]
-    fn proof_size_stable_across_profiles() {
-        for p in [
-            ProfileKind::Constrained,
-            ProfileKind::Sparse,
-            ProfileKind::Standard,
-        ] {
-            let mut s = LaunchSet::new(p);
-            s.append([2u8; 32]);
-            let proof = s.prove([2u8; 32]).unwrap();
-            assert_eq!(proof.siblings.len(), WINDOW_DEPTH);
-            assert!(proof.verify(s.window_root()));
-        }
+    fn commitment_binds_profile() {
+        let a = LaunchSet::new(ProfileKind::Standard);
+        let b = LaunchSet::new(ProfileKind::Dense);
+        assert_ne!(a.commitment(), b.commitment());
     }
 }
