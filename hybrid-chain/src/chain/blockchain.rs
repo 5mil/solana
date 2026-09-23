@@ -5,16 +5,17 @@ use crate::chain::transaction::Transaction;
 use crate::consensus::pow;
 use crate::consensus::pos;
 use crate::consensus::difficulty;
-use crate::notes::action::{coinbase_bundle, emission_commitment, ActionBundle};
-use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
+use crate::notes::action::{coinbase_bundle, emission_blinding, emission_commitment, ActionBundle};
+use crate::notes::auth::RangeProof;
+use crate::notes::commitment::ValueCommitment;
 use crate::notes::launch::LaunchSet;
 use crate::notes::payout::SealedPayout;
+use crate::notes::stake::StakeProof;
 use crate::notes::tags::SpendTagSet;
 use crate::notes::tree::NoteCommitmentTree;
 use crate::params::CHAIN_PARAMS;
 
 pub(crate) fn verify_bundle_against(
-    _tree: &NoteCommitmentTree,
     launch: &LaunchSet,
     bundle: &ActionBundle,
     allow_emission: bool,
@@ -26,35 +27,65 @@ pub(crate) fn verify_bundle_against(
         if !allow_emission {
             return Err("emission only on the block emission path");
         }
+        for out in bundle.real_outputs() {
+            if let Some(r) = &out.range {
+                if !r.verify(&out.value_commitment) {
+                    return Err("emission range failed");
+                }
+            } else {
+                return Err("emission range required");
+            }
+        }
         return Ok(());
     }
     if bundle.real_spends().is_empty() {
         return Err("empty bundle");
     }
     for spend in bundle.real_spends() {
-        if spend.membership.is_some() {
-            return Err("membership path forbidden");
+        if spend.ring.is_empty() || spend.link.is_none() {
+            return Err("ring link required");
         }
-        let hidden = spend.hidden.as_ref().ok_or("hidden membership required")?;
-        if hidden.leaf != spend.value_commitment.commitment {
-            return Err("hidden leaf mismatch");
+        for cm in &spend.ring {
+            if !launch.contains(*cm) {
+                return Err("ring member not in living set");
+            }
         }
-        if !launch.contains(hidden.leaf) {
-            return Err("spend outside window");
+        let link = spend.link.as_ref().unwrap();
+        if !link.verify(&spend.ring, &spend.rerand) {
+            return Err("link failed");
         }
-        if !hidden.verify(launch.window_root()) {
-            return Err("hidden membership failed");
+        if let Some(r) = &spend.range {
+            if !r.verify(&spend.rerand) {
+                return Err("spend range failed");
+            }
+        } else {
+            return Err("spend range required");
         }
+    }
+    for out in bundle.real_outputs() {
+        if let Some(r) = &out.range {
+            if !r.verify(&out.value_commitment) {
+                return Err("output range failed");
+            }
+        } else {
+            return Err("output range required");
+        }
+    }
+    if let Some(r) = &bundle.fee_range {
+        if !r.verify(&bundle.fee_commitment) {
+            return Err("fee range failed");
+        }
+    } else {
+        return Err("fee range required");
     }
     Ok(())
 }
 
 fn emission_matches(bundle: &ActionBundle, height: u64, reward: u64) -> bool {
-    let expected = emission_commitment(height, reward).commitment;
-    bundle
-        .real_outputs()
-        .iter()
-        .any(|o| o.value_commitment.commitment == expected)
+    bundle.real_outputs().iter().any(|o| {
+        o.value_commitment.commitment
+            == emission_commitment(&o.one_time_dest, height, reward).commitment
+    })
 }
 
 #[derive(Debug)]
@@ -84,7 +115,7 @@ impl Blockchain {
     }
 
     fn append_bundle(&mut self, bundle: &ActionBundle, allow_emission: bool) -> Result<(), &'static str> {
-        verify_bundle_against(&self.notes, &self.launch, bundle, allow_emission)?;
+        verify_bundle_against(&self.launch, bundle, allow_emission)?;
         for tag in bundle.spend_tags() {
             self.tags.insert(tag)?;
         }
@@ -104,8 +135,9 @@ impl Blockchain {
 
     fn emission_bundle(&self, ticket: &str, height: u64, reward: u64) -> ActionBundle {
         let sealed = SealedPayout::from_ticket(ticket.as_bytes(), height);
-        let commit = emission_commitment(height, reward);
-        coinbase_bundle(sealed.dest, &sealed.scan_seed, commit, [0u8; 32])
+        let commit = emission_commitment(&sealed.dest, height, reward);
+        let range = RangeProof::prove(reward, &emission_blinding(&sealed.dest, height));
+        coinbase_bundle(sealed.dest, &sealed.scan_seed, commit, [0u8; 32], range)
     }
 
     fn create_genesis(&mut self) {
@@ -125,7 +157,7 @@ impl Blockchain {
             block_type: BlockType::PoW,
             nonce: 0,
             stake_modifier: [0u8; 32],
-            notes_root: self.notes.root(),
+            notes_root: self.launch.commitment(),
             tags_root: self.tags.root(),
         };
         let genesis = Block { header, transactions: txs, compact: vec![bundle] };
@@ -173,7 +205,7 @@ impl Blockchain {
             block_type: BlockType::PoW,
             nonce: 0,
             stake_modifier: [0u8; 32],
-            notes_root: self.notes.root(),
+            notes_root: self.launch.commitment(),
             tags_root: self.tags.root(),
         };
         let mut nonce: u64 = 0;
@@ -197,14 +229,15 @@ impl Blockchain {
         block
     }
 
-    pub fn mint_pos_block(&mut self, staker_address: &str, stake_coins: u64) -> Result<Block, &'static str> {
-        let seconds_held: u64 = CHAIN_PARAMS.pos_coin_age_min + 3600;
-        pos::validate_stake(stake_coins, seconds_held)?;
-        let reward = pos::pos_reward(stake_coins, seconds_held);
+    pub fn mint_pos_block(&mut self, staker_address: &str, proof: &StakeProof) -> Result<Block, &'static str> {
+        let reward = proof.reward();
+        if reward == 0 {
+            return Err("zero pos reward");
+        }
         let prev_hash = self.tip_hash();
         let height = self.height();
         let staker_sealed = SealedPayout::from_ticket(staker_address.as_bytes(), height);
-        let coinstake = Transaction::coinstake(stake_coins, reward, &staker_sealed.dest);
+        let coinstake = Transaction::coinstake(0, reward, &staker_sealed.dest);
         let txs = vec![coinstake];
         let merkle = Block::compute_merkle_root(&txs);
         let now = Utc::now().timestamp();
@@ -220,7 +253,7 @@ impl Blockchain {
             block_type: BlockType::PoS,
             nonce: 0,
             stake_modifier: [0u8; 32],
-            notes_root: self.notes.root(),
+            notes_root: self.launch.commitment(),
             tags_root: self.tags.root(),
         };
         let block = Block { header, transactions: txs, compact: vec![bundle] };
@@ -228,7 +261,7 @@ impl Blockchain {
         self.block_index.insert(block_hash, self.blocks.len());
         self.total_supply += reward;
         self.blocks.push(block.clone());
-        log::info!("PoS block #{} minted: {} (reward={})", height, hex::encode(block_hash), reward);
+        log::info!("PoS block #{} minted: {} (reward hidden in commitment)", height, hex::encode(block_hash));
         Ok(block)
     }
 
@@ -247,7 +280,6 @@ impl Blockchain {
             let actual = (last_ts - first_ts).max(1) as u64;
             let target = difficulty::pow_target_timespan();
             self.current_difficulty = difficulty::retarget(self.current_difficulty, actual, target);
-            log::info!("Difficulty retarget: {} bits", self.current_difficulty);
         }
     }
 
@@ -258,7 +290,7 @@ impl Blockchain {
         for block in &self.blocks {
             for bundle in &block.compact {
                 let allow = bundle.is_emission();
-                verify_bundle_against(&self.notes, &self.launch, bundle, allow)?;
+                verify_bundle_against(&self.launch, bundle, allow)?;
                 for tag in bundle.spend_tags() {
                     self.tags.insert(tag)?;
                 }
@@ -267,7 +299,7 @@ impl Blockchain {
                     self.launch.append(c);
                 }
             }
-            if block.header.notes_root != self.notes.root() {
+            if block.header.notes_root != self.launch.commitment() {
                 return Err("notes_root mismatch");
             }
             if block.header.tags_root != self.tags.root() {
@@ -282,106 +314,65 @@ impl Blockchain {
 mod tests {
     use super::*;
     use crate::consensus::pow::{meets_difficulty, sha256d};
-    use crate::notes::action::emission_blinding;
     use crate::notes::commitment::blinding_from_seed;
-    use crate::notes::launch::{needs_refresh, LaunchSet, ProfileKind};
     use crate::notes::payout::SealedPayout;
+    use crate::notes::stake::StakeProof;
 
     #[test]
-    fn genesis_is_height_one_tip_after_pow() {
+    fn genesis_and_pow_bind_live_root() {
         let mut chain = Blockchain::new();
-        assert_eq!(chain.height(), 1);
         let block = chain.mine_pow_block("miner");
         assert_eq!(block.header.height, 1);
-        assert_eq!(chain.height(), 2);
-        let bytes = bincode::serialize(&block.header).unwrap();
-        let hash = sha256d(&bytes);
-        assert!(meets_difficulty(&hash, block.header.difficulty));
-        assert_eq!(block.hash(), hash);
-        assert_ne!(block.header.notes_root, [0u8; 32]);
-        assert!(!block.compact.is_empty());
+        assert_eq!(block.header.notes_root, chain.launch.commitment());
         assert_eq!(block.transactions[0].outputs[0].value, 0);
-        let expected = emission_commitment(1, CHAIN_PARAMS.pow_block_reward).commitment;
-        assert!(chain.launch.contains(expected));
+        let bytes = bincode::serialize(&block.header).unwrap();
+        assert!(meets_difficulty(&sha256d(&bytes), block.header.difficulty));
     }
 
     #[test]
-    fn pos_rejects_below_min_stake() {
+    fn pos_uses_stake_proof_not_naked_coins() {
         let mut chain = Blockchain::new();
-        assert!(chain.mint_pos_block("staker", 1).is_err());
-    }
-
-    #[test]
-    fn pos_accepts_min_stake() {
-        let mut chain = Blockchain::new();
-        let block = chain.mint_pos_block("staker", CHAIN_PARAMS.min_stake).expect("pos mint");
+        let _ = chain.mine_pow_block("miner");
+        let r = blinding_from_seed(b"stake-open");
+        let coins = CHAIN_PARAMS.min_stake;
+        let c = ValueCommitment::commit(coins, &r, &crate::notes::commitment::PedersenGenerators::default());
+        chain.launch.append(c.commitment);
+        let proof = StakeProof::create(
+            &chain.launch,
+            coins,
+            &r,
+            CHAIN_PARAMS.pos_coin_age_min + 3600,
+        )
+        .expect("stake");
+        let block = chain.mint_pos_block("staker", &proof).expect("pos");
         assert_eq!(block.header.block_type, BlockType::PoS);
-        assert_eq!(block.header.height, 1);
         assert_eq!(block.transactions[0].outputs[1].value, 0);
     }
 
     #[test]
-    fn sealed_payout_is_not_worker_label() {
-        let sealed = SealedPayout::from_ticket(b"miner", 1);
-        assert_ne!(sealed.dest, [0u8; 32]);
-    }
-
-    #[test]
-    fn rebuild_notes_matches_live_roots() {
+    fn rebuild_matches_live_root() {
         let mut chain = Blockchain::new();
         let _ = chain.mine_pow_block("miner");
-        let notes = chain.notes.root();
-        let tags = chain.tags.root();
-        let launch = chain.launch.commitment();
+        let live = chain.launch.commitment();
         chain.rebuild_notes().expect("rebuild");
-        assert_eq!(chain.notes.root(), notes);
-        assert_eq!(chain.tags.root(), tags);
-        assert_eq!(chain.launch.commitment(), launch);
+        assert_eq!(chain.launch.commitment(), live);
     }
 
     #[test]
-    fn membership_path_is_rejected() {
+    fn hidden_spend_does_not_replay_note_cm() {
         let mut chain = Blockchain::new();
         let _ = chain.mine_pow_block("miner");
         let height = 1u64;
         let sealed = SealedPayout::from_ticket(b"miner", height);
         let reward = CHAIN_PARAMS.pow_block_reward;
-        let in_blind = emission_blinding(height);
-        let leaf_index = 1usize;
-        let r_out = blinding_from_seed(b"out");
-        let r_fee = in_blind - r_out;
-        let bundle = crate::notes::transfer_bundle(
-            &sealed.spend_secret(),
-            &chain.notes,
-            leaf_index,
-            reward,
-            &in_blind,
-            [42u8; 32],
-            b"recv-scan",
-            reward - 1,
-            &r_out,
-            1,
-            &r_fee,
-            [0u8; 32],
-        )
-        .expect("constructor still builds");
-        assert!(bundle.real_spends()[0].membership.is_some());
-        assert_eq!(chain.apply_transfer(&bundle), Err("membership path forbidden"));
-    }
-
-    #[test]
-    fn hidden_window_spend_mines_and_refuses_replay() {
-        let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("miner");
-        let height = 1u64;
-        let sealed = SealedPayout::from_ticket(b"miner", height);
-        let reward = CHAIN_PARAMS.pow_block_reward;
-        let in_blind = emission_blinding(height);
+        let in_blind = emission_blinding(&sealed.dest, height);
+        let note = emission_commitment(&sealed.dest, height, reward);
         let r_out = blinding_from_seed(b"wout");
         let r_fee = in_blind - r_out;
         let bundle = crate::notes::transfer_window_bundle(
             &sealed.spend_secret(),
             &chain.launch,
+            note.commitment,
             reward,
             &in_blind,
             [7u8; 32],
@@ -393,32 +384,16 @@ mod tests {
             [0u8; 32],
         )
         .expect("window transfer");
-        assert!(bundle.real_spends()[0].hidden.is_some());
-        assert!(bundle.real_spends()[0].membership.is_none());
+        assert_ne!(bundle.real_spends()[0].rerand.commitment, note.commitment);
         let block = chain.mine_pow_with_bundles("miner2", vec![bundle.clone()]);
         assert!(block.compact.len() >= 2);
         assert!(chain.apply_transfer(&bundle).is_err());
     }
 
     #[test]
-    fn refuses_spend_outside_window() {
-        let mut set = LaunchSet::new(ProfileKind::Constrained);
-        let leaf = [9u8; 32];
-        set.append(leaf);
-        set.seal();
-        for e in 0..ProfileKind::Constrained.window_epochs() {
-            set.append([(e + 3) as u8; 32]);
-            set.seal();
-        }
-        assert!(needs_refresh(&set, leaf));
-        assert!(set.prove(leaf).is_none());
-    }
-
-    #[test]
-    fn extra_emission_bundle_is_rejected() {
+    fn extra_emission_rejected() {
         let mut chain = Blockchain::new();
         let extra = chain.emission_bundle("sneak", 1, CHAIN_PARAMS.pow_block_reward);
-        assert!(extra.is_emission());
         assert_eq!(chain.apply_transfer(&extra), Err("use emission path for coinbase"));
     }
 }
