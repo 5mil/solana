@@ -6,7 +6,7 @@ use crate::consensus::difficulty;
 use crate::notes::action::ActionBundle;
 use crate::notes::launch::LaunchSet;
 use crate::notes::payout::SealedPayout;
-use crate::notes::spend::{emission_bundle, transfer_window_bundle};
+use crate::notes::spend::emission_bundle;
 use crate::notes::stake::StakeProof;
 use crate::notes::tags::SpendTagSet;
 use crate::params::CHAIN_PARAMS;
@@ -16,6 +16,7 @@ pub(crate) fn verify_bundle_against(
     bundle: &ActionBundle,
     allow_emission: bool,
     reward: Option<u64>,
+    height: u64,
 ) -> Result<(), &'static str> {
     if !bundle.verify_conservation() {
         return Err("conservation failed");
@@ -32,7 +33,7 @@ pub(crate) fn verify_bundle_against(
             .map(|o| o.value_commitment.commitment)
             .collect();
         let proof = bundle.emission.as_ref().ok_or("emission OR required")?;
-        if !proof.verify(&cms, reward) {
+        if !proof.verify(&cms, reward, height) {
             return Err("emission OR failed");
         }
         return Ok(());
@@ -40,17 +41,32 @@ pub(crate) fn verify_bundle_against(
     if bundle.real_spends().is_empty() {
         return Err("empty bundle");
     }
-    let live = launch.window_root();
+    let mut ctx = Vec::new();
+    ctx.extend_from_slice(&launch.window_root());
+    ctx.extend_from_slice(&height.to_le_bytes());
     for spend in bundle.real_spends() {
         let proof = spend.proof.as_ref().ok_or("note proof required")?;
-        if !proof.membership.verify(live) {
-            return Err("window membership failed");
-        }
-        if !launch.contains(proof.membership.note_id) {
-            return Err("note not in living set");
-        }
-        if !proof.auth.verify(&spend.spend_tag, &live, &spend.rerand.commitment) {
-            return Err("spend auth failed");
+        let outs = bundle.real_outputs();
+        let out_c = outs
+            .first()
+            .map(|o| o.value_commitment.clone())
+            .ok_or("spend missing output")?;
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(&spend.spend_tag);
+        transcript.extend_from_slice(&out_c.commitment);
+        transcript.extend_from_slice(&bundle.fee_commitment.commitment);
+        transcript.extend_from_slice(&launch.window_root());
+        transcript.extend_from_slice(&height.to_le_bytes());
+        if !proof.verify(
+            &spend.spend_tag,
+            &spend.rerand,
+            &out_c,
+            &bundle.fee_commitment,
+            launch,
+            &ctx,
+            &transcript,
+        ) {
+            return Err("note proof failed");
         }
     }
     Ok(())
@@ -85,13 +101,14 @@ impl Blockchain {
         bundle: &ActionBundle,
         allow_emission: bool,
         reward: Option<u64>,
+        height: u64,
     ) -> Result<(), &'static str> {
-        verify_bundle_against(&self.launch, bundle, allow_emission, reward)?;
+        verify_bundle_against(&self.launch, bundle, allow_emission, reward, height)?;
         for tag in bundle.spend_tags() {
             self.tags.insert(tag)?;
         }
-        for id in bundle.output_note_ids() {
-            self.launch.append(id);
+        for c in bundle.output_commitments() {
+            self.launch.append(c);
         }
         Ok(())
     }
@@ -100,17 +117,18 @@ impl Blockchain {
         if bundle.is_emission() {
             return Err("use emission path");
         }
-        self.append_bundle(bundle, false, None)
+        let h = self.height();
+        self.append_bundle(bundle, false, None, h)
     }
 
     fn create_genesis(&mut self) {
         let pay = SealedPayout::from_wallet_seed(b"genesis-wallet", 0);
         let bundle = emission_bundle(&pay.spend, &pay.scan, 0, CHAIN_PARAMS.pow_block_reward, [0u8; 16]);
-        self.append_bundle(&bundle, true, Some(CHAIN_PARAMS.pow_block_reward))
+        self.append_bundle(&bundle, true, Some(CHAIN_PARAMS.pow_block_reward), 0)
             .expect("genesis");
         let compact = vec![bundle];
         let header = BlockHeader {
-            version: 3,
+            version: 4,
             height: 0,
             prev_hash: [0u8; 32],
             merkle_root: Block::compute_merkle_root(&compact),
@@ -137,26 +155,27 @@ impl Blockchain {
         self.blocks.len() as u64
     }
 
-    pub fn mine_pow_block(&mut self, wallet_seed: &str) -> Block {
-        self.mine_pow_with_bundles(wallet_seed, Vec::new())
-    }
-
-    pub fn mine_pow_with_bundles(&mut self, wallet_seed: &str, extra: Vec<ActionBundle>) -> Block {
+    /// `ticket` is a pool label only. Payout keys come from `payout`, never the ticket.
+    pub fn mine_pow_with_payout(
+        &mut self,
+        _ticket: &str,
+        payout: &SealedPayout,
+        extra: Vec<ActionBundle>,
+    ) -> Block {
         for b in &extra {
-            self.append_bundle(b, false, None).expect("extra");
+            let h = self.height();
+            self.append_bundle(b, false, None, h).expect("extra");
         }
-        let prev_hash = self.tip_hash();
         let height = self.height();
         let reward = self.current_pow_reward();
-        let pay = SealedPayout::from_wallet_seed(wallet_seed.as_bytes(), height);
-        let bundle = emission_bundle(&pay.spend, &pay.scan, height, reward, height.to_le_bytes()[..16].try_into().unwrap_or([0u8; 16]));
-        self.append_bundle(&bundle, true, Some(reward)).expect("emission");
+        let bundle = emission_bundle(&payout.spend, &payout.scan, height, reward, [7u8; 16]);
+        self.append_bundle(&bundle, true, Some(reward), height).expect("emission");
         let mut compact = extra;
         compact.push(bundle);
         let mut header = BlockHeader {
-            version: 3,
+            version: 4,
             height,
-            prev_hash,
+            prev_hash: self.tip_hash(),
             merkle_root: Block::compute_merkle_root(&compact),
             timestamp: Utc::now().timestamp(),
             difficulty: self.current_difficulty,
@@ -184,18 +203,28 @@ impl Blockchain {
         block
     }
 
-    pub fn mint_pos_block(&mut self, wallet_seed: &str, proof: &StakeProof) -> Result<Block, &'static str> {
+    pub fn mine_pow_block(&mut self, ticket: &str) -> Block {
+        let pay = SealedPayout::from_wallet_seed(b"independent-dev-wallet", self.height());
+        let _ = ticket;
+        self.mine_pow_with_payout(ticket, &pay, Vec::new())
+    }
+
+    pub fn mine_pow_with_bundles(&mut self, ticket: &str, extra: Vec<ActionBundle>) -> Block {
+        let pay = SealedPayout::from_wallet_seed(b"independent-dev-wallet", self.height());
+        self.mine_pow_with_payout(ticket, &pay, extra)
+    }
+
+    pub fn mint_pos_block(&mut self, payout: &SealedPayout, proof: &StakeProof) -> Result<Block, &'static str> {
         let reward = proof.reward();
         if reward == 0 {
             return Err("zero pos reward");
         }
         let height = self.height();
-        let pay = SealedPayout::from_wallet_seed(wallet_seed.as_bytes(), height);
-        let bundle = emission_bundle(&pay.spend, &pay.scan, height, reward, [9u8; 16]);
-        self.append_bundle(&bundle, true, Some(reward))?;
+        let bundle = emission_bundle(&payout.spend, &payout.scan, height, reward, [9u8; 16]);
+        self.append_bundle(&bundle, true, Some(reward), height)?;
         let compact = vec![bundle];
         let header = BlockHeader {
-            version: 3,
+            version: 4,
             height,
             prev_hash: self.tip_hash(),
             merkle_root: Block::compute_merkle_root(&compact),
@@ -239,18 +268,20 @@ impl Blockchain {
         for block in &self.blocks {
             let reward = if block.header.block_type == BlockType::PoW {
                 Some(pow_reward_at_height(block.header.height))
+            } else if let Some(b) = block.compact.iter().find(|b| b.is_emission()) {
+                b.emission.as_ref().map(|e| e.reward)
             } else {
                 None
             };
             for bundle in &block.compact {
                 let allow = bundle.is_emission();
                 let r = if allow { reward } else { None };
-                verify_bundle_against(&self.launch, bundle, allow, r)?;
+                verify_bundle_against(&self.launch, bundle, allow, r, block.header.height)?;
                 for tag in bundle.spend_tags() {
                     self.tags.insert(tag)?;
                 }
-                for id in bundle.output_note_ids() {
-                    self.launch.append(id);
+                for c in bundle.output_commitments() {
+                    self.launch.append(c);
                 }
             }
             if block.header.notes_root != self.launch.commitment() {
@@ -270,23 +301,30 @@ fn pow_reward_at_height(height: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
-    use crate::notes::keys::{note_id, SpendKey};
-    use crate::notes::proof::asset_scalar;
+    use crate::notes::keys::SpendKey;
+    use crate::notes::spend::transfer_window_bundle;
     use crate::notes::stake::StakeProof;
 
     #[test]
     fn compact_only_pow() {
         let mut chain = Blockchain::new();
-        let block = chain.mine_pow_block("wallet-miner");
+        let block = chain.mine_pow_block("pool-ticket");
         assert!(block.compact.len() >= 1);
         assert_eq!(block.header.notes_root, chain.launch.commitment());
     }
 
     #[test]
-    fn spend_needs_owner_key() {
+    fn ticket_is_not_payout_seed() {
+        let a = SealedPayout::from_wallet_seed(b"independent-dev-wallet", 1);
+        let b = SealedPayout::from_wallet_seed(b"pool-ticket", 1);
+        assert_ne!(a.dest.bytes, b.dest.bytes);
+    }
+
+    #[test]
+    fn spend_uses_key_image_not_dest() {
         let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("wallet-miner");
-        let pay = SealedPayout::from_wallet_seed(b"wallet-miner", 1);
+        let pay = SealedPayout::from_wallet_seed(b"independent-dev-wallet", 1);
+        let _ = chain.mine_pow_with_payout("pool-ticket", &pay, Vec::new());
         let reward = CHAIN_PARAMS.pow_block_reward;
         let r = blinding_from_seed(&[b"emit-r".as_ref(), &pay.spend.sk.to_bytes(), &1u64.to_le_bytes()].concat());
         let cm = crate::notes::proof::commit_with_asset(reward, &r, &[0u8; 32]).commitment;
@@ -306,25 +344,26 @@ mod tests {
             1,
             &r_fee,
             [4u8; 16],
+            2,
         )
         .expect("owned spend");
-        assert!(bundle.real_spends()[0].proof.is_some());
-        let _ = chain.mine_pow_with_bundles("wallet-2", vec![bundle.clone()]);
+        let encoded = format!("{:?}", bundle.real_spends()[0].proof);
+        assert!(!encoded.contains("dest"));
+        let _ = chain.mine_pow_with_bundles("pool-ticket", vec![bundle.clone()]);
         assert!(chain.apply_transfer(&bundle).is_err());
     }
 
     #[test]
     fn pos_takes_stake_proof() {
         let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("w");
-        let sk = SpendKey::from_wallet_seed(b"staker-w");
+        let _ = chain.mine_pow_block("t");
         let r = blinding_from_seed(b"stk");
         let coins = CHAIN_PARAMS.min_stake;
         let c = ValueCommitment::commit(coins, &r, &PedersenGenerators::default());
-        let nid = note_id(&c.commitment, &sk.pk(), &asset_scalar(&[0u8; 32]));
-        chain.launch.append(nid);
+        chain.launch.append(c.commitment);
         let proof = StakeProof::create(&chain.launch, &c, coins, CHAIN_PARAMS.pos_coin_age_min + 3600)
             .expect("stake");
-        assert!(chain.mint_pos_block("staker-w", &proof).is_ok());
+        let pay = SealedPayout::from_wallet_seed(b"staker-wallet", chain.height());
+        assert!(chain.mint_pos_block(&pay, &proof).is_ok());
     }
 }
