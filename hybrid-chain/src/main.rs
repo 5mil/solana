@@ -21,10 +21,8 @@ fn print_banner() {
     println!("Chain: {}", CHAIN_PARAMS.name);
     println!("Ticker: {}", CHAIN_PARAMS.ticker);
     println!("Max Supply: {} coins", CHAIN_PARAMS.max_supply);
-    println!("PoW Block Reward: {} coins", CHAIN_PARAMS.pow_block_reward);
-    println!("PoS Annual Rate: {}%", CHAIN_PARAMS.pos_annual_rate * 100.0);
     println!("Default pool: {}", DefaultPool::name());
-    println!("Notes: compact coinbase + commitment tree + spend tags");
+    println!("Notes: nullifier spends + living set + range + binding");
 }
 
 fn mine_and_persist(path: &Path) {
@@ -35,8 +33,8 @@ fn mine_and_persist(path: &Path) {
         hex::encode(blockchain.tip_hash())
     );
     println!(
-        "Genesis notes_root: {}",
-        hex::encode(blockchain.notes.root())
+        "Genesis live root: {}",
+        hex::encode(blockchain.launch.commitment())
     );
 
     let pool = DefaultPool::new();
@@ -49,7 +47,7 @@ fn mine_and_persist(path: &Path) {
         hex::encode(pow_block.hash())
     );
     println!(
-        "Sealed payout dest: {} (worker label not used as dest)",
+        "Sealed payout dest: {}",
         hex::encode(sealed.dest)
     );
     println!(
@@ -77,11 +75,6 @@ fn mine_and_persist(path: &Path) {
         process::exit(1);
     });
     println!("Persisted chain to {}", path.display());
-    println!(
-        "Pool stats: accepted={} rejected={}",
-        pool.accepted_count(),
-        pool.rejected_count()
-    );
 }
 
 fn replay(path: &Path) {
@@ -109,11 +102,6 @@ fn replay(path: &Path) {
         "Stored PoW block #{} still valid: {}",
         pow.header.height,
         hex::encode(pow.hash())
-    );
-    println!(
-        "notes_root={} compact_actions={}",
-        hex::encode(pow.header.notes_root),
-        pow.compact.first().map(|b| b.actions.len()).unwrap_or(0)
     );
 }
 
