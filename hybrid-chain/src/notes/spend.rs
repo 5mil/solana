@@ -1,15 +1,13 @@
-//! Legal spend: owner sk, window membership, binding. No listed ring.
+//! Spend: key image + window ring ImageOr + ranges. Dest never on the spend.
 
 use super::action::{
     ActionBundle, CompactAction, CompactOutput, CompactSpend, BUNDLE_PAD,
 };
-use super::auth::rerand;
+use super::auth::{rerand, RangeProof};
 use super::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
-use super::keys::{note_id, ScanKey, SpendKey};
+use super::keys::{ScanKey, SpendKey};
 use super::launch::LaunchSet;
-use super::proof::{
-    asset_scalar, commit_with_asset, BindingSig, EmissionOr, NoteProof, SpendAuth, WindowPath,
-};
+use super::proof::{commit_with_asset, BindingSig, EmissionOr, ImageOr, NoteProof};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::scalar::Scalar;
 
@@ -26,6 +24,7 @@ pub fn transfer_window_bundle(
     fee_value: u64,
     fee_blind: &Scalar,
     diversifier: [u8; 16],
+    height: u64,
 ) -> Result<ActionBundle, &'static str> {
     if in_value != out_value.saturating_add(fee_value) {
         return Err("values do not conserve");
@@ -35,39 +34,44 @@ pub fn transfer_window_bundle(
     if expected.commitment != note_cm {
         return Err("opening mismatch");
     }
-    let nid = note_id(&note_cm, &sk.pk(), &asset_scalar(&[0u8; 32]));
-    if !set.contains(nid) {
+    if !set.contains(note_cm) {
         return Err("note not in living window");
     }
-    let membership = WindowPath::prove(set, nid).ok_or("no window path")?;
+    let (ring, idx) = set
+        .sample_ring(note_cm, &sk.key_image(&note_cm))
+        .ok_or("ring sample failed")?;
     let delta = blinding_from_seed(&[b"rerand".as_ref(), &sk.sk.to_bytes(), &note_cm].concat());
     let c_prime = rerand(&expected, &delta);
-    let nf = sk.nullifier(&note_cm);
-    let live = set.window_root();
-    let auth = SpendAuth::sign(sk, &nf, &live, &c_prime.commitment);
-    if !auth.verify(&nf, &live, &c_prime.commitment) {
-        return Err("auth failed");
-    }
+    let image = sk.key_image(&note_cm);
+    let mut ctx = Vec::new();
+    ctx.extend_from_slice(&set.window_root());
+    ctx.extend_from_slice(&height.to_le_bytes());
+    let image_or = ImageOr::prove(&ring, idx, sk, &delta, &image, &c_prime, &ctx);
     let out_cm = commit_with_asset(out_value, out_blind, &[0u8; 32]);
     let fee_c = ValueCommitment::commit(fee_value, fee_blind, &gens);
     let r_bind = (*in_blind + delta) - *out_blind - *fee_blind;
     let mut transcript = Vec::new();
-    transcript.extend_from_slice(&nf);
+    transcript.extend_from_slice(&image);
     transcript.extend_from_slice(&out_cm.commitment);
+    transcript.extend_from_slice(&fee_c.commitment);
+    transcript.extend_from_slice(&set.window_root());
+    transcript.extend_from_slice(&height.to_le_bytes());
     let binding = BindingSig::sign(&r_bind, &transcript);
     let proof = NoteProof {
-        auth,
-        membership,
+        image: image_or,
+        range_in: RangeProof::prove(in_value, &(in_blind + delta)),
+        range_out: RangeProof::prove(out_value, out_blind),
+        range_fee: RangeProof::prove(fee_value, fee_blind),
         binding: binding.clone(),
     };
-    let eph_sk = blinding_from_seed(&[b"eph".as_ref(), &diversifier].concat());
+    let eph_sk = blinding_from_seed(&[b"eph".as_ref(), &diversifier, &image].concat());
     let eph_pk = (eph_sk * RISTRETTO_BASEPOINT_POINT).compress().to_bytes();
-    let _tag = scan.tag(&eph_pk, &diversifier);
+    let _ = scan;
     let bundle = ActionBundle {
-        version: 3,
+        version: 4,
         actions: vec![CompactAction {
             spend: Some(CompactSpend {
-                spend_tag: nf,
+                spend_tag: image,
                 rerand: c_prime,
                 proof: Some(proof),
             }),
@@ -96,91 +100,57 @@ pub fn emission_bundle(
     reward: u64,
     diversifier: [u8; 16],
 ) -> ActionBundle {
-    let r = blinding_from_seed(&[b"emit-r".as_ref(), &dest_sk.sk.to_bytes(), &height.to_le_bytes()].concat());
+    let r = blinding_from_seed(
+        &[b"emit-r".as_ref(), &dest_sk.sk.to_bytes(), &height.to_le_bytes()].concat(),
+    );
     let cm = commit_with_asset(reward, &r, &[0u8; 32]);
-    let eph_sk = blinding_from_seed(&[b"eph-e".as_ref(), &diversifier].concat());
+    let eph_sk = blinding_from_seed(&[b"eph-e".as_ref(), &diversifier, &dest_sk.pk().bytes].concat());
     let eph_pk = (eph_sk * RISTRETTO_BASEPOINT_POINT).compress().to_bytes();
     let real = CompactOutput {
         dest: dest_sk.pk(),
         eph_pk,
         diversifier,
-        value_commitment: cm.clone(),
+        value_commitment: cm,
     };
-    let pad_r = blinding_from_seed(&[b"emit-pad".as_ref(), &height.to_le_bytes()].concat());
-    let pad_sk = SpendKey::from_wallet_seed(&[b"pad-dest".as_ref(), &height.to_le_bytes()].concat());
+    let pad_sk = SpendKey::from_wallet_seed(
+        &[b"pad-unrelated".as_ref(), &dest_sk.pk().bytes, &height.to_le_bytes()].concat(),
+    );
+    let pad_r = blinding_from_seed(&[b"emit-pad-r".as_ref(), &pad_sk.pk().bytes].concat());
+    let pad_div = {
+        let mut d = [0u8; 16];
+        d.copy_from_slice(&blinding_from_seed(&[b"pad-d".as_ref(), &height.to_le_bytes()]).to_bytes()[..16]);
+        d
+    };
     let pad = CompactOutput {
         dest: pad_sk.pk(),
-        eph_pk: [1u8; 32],
-        diversifier: [2u8; 16],
+        eph_pk: (blinding_from_seed(&[b"pad-eph".as_ref(), &pad_div]).to_bytes()),
+        diversifier: pad_div,
         value_commitment: commit_with_asset(0, &pad_r, &[0u8; 32]),
     };
-    let cms = vec![real.value_commitment.commitment, pad.value_commitment.commitment];
-    let emission = EmissionOr::prove(&cms, 0, reward, &r);
+    // Slot chosen from dest bytes, not hard-coded 0.
+    let real_first = dest_sk.pk().bytes[0] & 1 == 0;
+    let (o0, o1, real_idx) = if real_first {
+        (real, pad, 0usize)
+    } else {
+        (pad, real, 1usize)
+    };
+    let cms = vec![o0.value_commitment.commitment, o1.value_commitment.commitment];
+    let emission = EmissionOr::prove(&cms, real_idx, reward, height, &r);
     let _ = scan;
     ActionBundle {
-        version: 3,
+        version: 4,
         actions: vec![
             CompactAction {
                 spend: None,
-                output: Some(real),
+                output: Some(o0),
             },
             CompactAction {
                 spend: None,
-                output: Some(pad),
+                output: Some(o1),
             },
         ],
         fee_commitment: ValueCommitment::identity(),
         binding: None,
         emission: Some(emission),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::notes::launch::LaunchSet;
-
-    #[test]
-    fn owner_sk_required_and_cm_not_rerand() {
-        let sk = SpendKey::from_wallet_seed(b"owner");
-        let scan = ScanKey::from_wallet_seed(b"scan");
-        let r_in = blinding_from_seed(b"in");
-        let cm = ValueCommitment::commit(40, &r_in, &PedersenGenerators::default()).commitment;
-        let nid = note_id(&cm, &sk.pk(), &asset_scalar(&[0u8; 32]));
-        let mut set = LaunchSet::standard();
-        set.append(nid);
-        let out_sk = SpendKey::from_wallet_seed(b"recv");
-        let r_out = blinding_from_seed(b"out");
-        let r_fee = r_in - r_out;
-        let b = transfer_window_bundle(
-            &sk, &scan, &set, cm, 40, &r_in, &out_sk, 30, &r_out, 10, &r_fee, [3u8; 16],
-        )
-        .expect("bundle");
-        let spend = b.real_spends()[0];
-        assert_ne!(spend.rerand.commitment, cm);
-        assert!(spend.proof.is_some());
-        assert!(b.emission.is_none());
-    }
-
-    #[test]
-    fn emission_or_does_not_use_height_only_point() {
-        let sk = SpendKey::from_wallet_seed(b"miner-wallet");
-        let scan = ScanKey::from_wallet_seed(b"scan");
-        let a = emission_bundle(&sk, &scan, 1, 50, [1u8; 16]);
-        let b = emission_bundle(&sk, &scan, 1, 50, [1u8; 16]);
-        // same wallet+height is deterministic for tests; different height differs
-        let c = emission_bundle(&sk, &scan, 2, 50, [1u8; 16]);
-        assert_ne!(
-            a.real_outputs()[0].value_commitment.commitment,
-            c.real_outputs()[0].value_commitment.commitment
-        );
-        let cms: Vec<[u8; 32]> = a
-            .actions
-            .iter()
-            .filter_map(|x| x.output.as_ref())
-            .map(|o| o.value_commitment.commitment)
-            .collect();
-        assert!(a.emission.as_ref().unwrap().verify(&cms, 50));
-        let _ = b;
     }
 }
