@@ -7,6 +7,7 @@ use crate::consensus::pos;
 use crate::consensus::difficulty;
 use crate::notes::action::{coinbase_bundle, ActionBundle};
 use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
+use crate::notes::launch::LaunchSet;
 use crate::notes::payout::SealedPayout;
 use crate::notes::tags::SpendTagSet;
 use crate::notes::tree::NoteCommitmentTree;
@@ -14,6 +15,7 @@ use crate::params::CHAIN_PARAMS;
 
 pub(crate) fn verify_bundle_against(
     tree: &NoteCommitmentTree,
+    launch: &LaunchSet,
     bundle: &ActionBundle,
 ) -> Result<(), &'static str> {
     if !bundle.verify_conservation() {
@@ -23,6 +25,18 @@ pub(crate) fn verify_bundle_against(
         return Ok(());
     }
     for spend in bundle.real_spends() {
+        if let Some(hidden) = spend.hidden.as_ref() {
+            if hidden.leaf != spend.value_commitment.commitment {
+                return Err("hidden leaf mismatch");
+            }
+            if !launch.contains(hidden.leaf) {
+                return Err("spend outside window");
+            }
+            if !hidden.verify(launch.window_root()) {
+                return Err("hidden membership failed");
+            }
+            continue;
+        }
         let proof = spend.membership.as_ref().ok_or("missing membership")?;
         if proof.leaf != spend.value_commitment.commitment {
             return Err("membership leaf mismatch");
@@ -41,6 +55,7 @@ pub struct Blockchain {
     pub current_difficulty: u32,
     pub total_supply: u64,
     pub notes: NoteCommitmentTree,
+    pub launch: LaunchSet,
     pub tags: SpendTagSet,
 }
 
@@ -52,6 +67,7 @@ impl Blockchain {
             current_difficulty: CHAIN_PARAMS.initial_difficulty,
             total_supply: 0,
             notes: NoteCommitmentTree::new(),
+            launch: LaunchSet::standard(),
             tags: SpendTagSet::new(),
         };
         chain.create_genesis();
@@ -59,12 +75,13 @@ impl Blockchain {
     }
 
     fn append_bundle(&mut self, bundle: &ActionBundle) -> Result<(), &'static str> {
-        verify_bundle_against(&self.notes, bundle)?;
+        verify_bundle_against(&self.notes, &self.launch, bundle)?;
         for tag in bundle.spend_tags() {
             self.tags.insert(tag)?;
         }
         for c in bundle.output_commitments() {
             self.notes.append(c);
+            self.launch.append(c);
         }
         Ok(())
     }
@@ -228,15 +245,17 @@ impl Blockchain {
 
     pub fn rebuild_notes(&mut self) -> Result<(), &'static str> {
         self.notes = NoteCommitmentTree::new();
+        self.launch = LaunchSet::standard();
         self.tags = SpendTagSet::new();
         for block in &self.blocks {
             for bundle in &block.compact {
-                verify_bundle_against(&self.notes, bundle)?;
+                verify_bundle_against(&self.notes, &self.launch, bundle)?;
                 for tag in bundle.spend_tags() {
                     self.tags.insert(tag)?;
                 }
                 for c in bundle.output_commitments() {
                     self.notes.append(c);
+                    self.launch.append(c);
                 }
             }
             if block.header.notes_root != self.notes.root() {
@@ -255,6 +274,7 @@ mod tests {
     use super::*;
     use crate::consensus::pow::{meets_difficulty, sha256d};
     use crate::notes::commitment::blinding_from_seed;
+    use crate::notes::launch::{needs_refresh, LaunchSet, ProfileKind};
     use crate::notes::payout::SealedPayout;
 
     #[test]
@@ -270,6 +290,11 @@ mod tests {
         assert_eq!(block.hash(), hash);
         assert_ne!(block.header.notes_root, [0u8; 32]);
         assert!(!block.compact.is_empty());
+        assert!(chain.launch.contains({
+            let sealed = SealedPayout::from_ticket(b"miner", 1);
+            let blind = blinding_from_seed(&[b"miner".as_ref(), &1u64.to_le_bytes()].concat());
+            ValueCommitment::commit(CHAIN_PARAMS.pow_block_reward, &blind, &PedersenGenerators::default()).commitment
+        }));
     }
 
     #[test]
@@ -299,9 +324,11 @@ mod tests {
         let _ = chain.mine_pow_block("miner");
         let notes = chain.notes.root();
         let tags = chain.tags.root();
+        let launch = chain.launch.commitment();
         chain.rebuild_notes().expect("rebuild");
         assert_eq!(chain.notes.root(), notes);
         assert_eq!(chain.tags.root(), tags);
+        assert_eq!(chain.launch.commitment(), launch);
     }
 
     #[test]
@@ -333,5 +360,49 @@ mod tests {
         let block = chain.mine_pow_with_bundles("miner2", vec![bundle.clone()]);
         assert!(block.compact.len() >= 2);
         assert!(chain.apply_transfer(&bundle).is_err());
+    }
+
+    #[test]
+    fn hidden_window_spend_mines_and_refuses_replay() {
+        let mut chain = Blockchain::new();
+        let _ = chain.mine_pow_block("miner");
+        let height = 1u64;
+        let sealed = SealedPayout::from_ticket(b"miner", height);
+        let reward = CHAIN_PARAMS.pow_block_reward;
+        let in_blind = blinding_from_seed(&[b"miner".as_ref(), &height.to_le_bytes()].concat());
+        let r_out = blinding_from_seed(b"wout");
+        let r_fee = in_blind - r_out;
+        let bundle = crate::notes::transfer_window_bundle(
+            &sealed.spend_secret(),
+            &chain.launch,
+            reward,
+            &in_blind,
+            [7u8; 32],
+            b"recv-scan",
+            reward - 1,
+            &r_out,
+            1,
+            &r_fee,
+            [0u8; 32],
+        )
+        .expect("window transfer");
+        assert!(bundle.real_spends()[0].hidden.is_some());
+        let block = chain.mine_pow_with_bundles("miner2", vec![bundle.clone()]);
+        assert!(block.compact.len() >= 2);
+        assert!(chain.apply_transfer(&bundle).is_err());
+    }
+
+    #[test]
+    fn refuses_spend_outside_window() {
+        let mut set = LaunchSet::new(ProfileKind::Constrained);
+        let leaf = [9u8; 32];
+        set.append(leaf);
+        set.seal();
+        for e in 0..ProfileKind::Constrained.window_epochs() {
+            set.append([(e + 3) as u8; 32]);
+            set.seal();
+        }
+        assert!(needs_refresh(&set, leaf));
+        assert!(set.prove(leaf).is_none());
     }
 }
