@@ -106,7 +106,11 @@ impl Blockchain {
             let reward = if block.header.block_type == BlockType::PoW {
                 Some(pow_reward_at_height(block.header.height))
             } else {
-                None
+                block
+                    .compact
+                    .iter()
+                    .find(|b| b.is_emission())
+                    .and_then(|b| b.emission.as_ref().map(|e| e.reward))
             };
             for bundle in &block.compact {
                 crate::chain::blockchain::verify_bundle_against(
@@ -114,14 +118,15 @@ impl Blockchain {
                     bundle,
                     bundle.is_emission(),
                     if bundle.is_emission() { reward } else { None },
+                    block.header.height,
                 )
                 .map_err(|e| StoreError::Invalid(format!("bundle at {i}: {e}")))?;
                 for tag in bundle.spend_tags() {
                     tags.insert(tag)
                         .map_err(|e| StoreError::Invalid(format!("tag at {i}: {e}")))?;
                 }
-                for id in bundle.output_note_ids() {
-                    launch.append(id);
+                for c in bundle.output_commitments() {
+                    launch.append(c);
                 }
             }
             if block.header.notes_root != launch.commitment() {
@@ -157,7 +162,7 @@ mod tests {
     #[test]
     fn persist_live_root() {
         let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("wallet-disk");
+        let _ = chain.mine_pow_block("pool-ticket");
         let dir = isolated_path("ok");
         let path = dir.join("chain.bin");
         chain.save_to_path(&path).unwrap();
