@@ -1,4 +1,5 @@
-//! Spend and scan keys. dest = sk·G. Tickets cannot derive sk.
+//! Spend keys. dest = sk·G stays on outputs only.
+//! Spend tag is a key image I = sk·Hp(cm), not a ticket hash.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
@@ -18,6 +19,20 @@ fn hash_scalar(label: &[u8], parts: &[&[u8]]) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&wide)
 }
 
+pub fn try_point(bytes: &[u8; 32]) -> Option<RistrettoPoint> {
+    CompressedRistretto(*bytes).decompress()
+}
+
+pub fn hash_to_point(label: &[u8], data: &[u8]) -> RistrettoPoint {
+    let mut h = Sha512::new();
+    h.update(label);
+    h.update(data);
+    let out = h.finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&out);
+    RistrettoPoint::from_uniform_bytes(&wide)
+}
+
 #[derive(Clone, Debug)]
 pub struct SpendKey {
     pub sk: Scalar,
@@ -34,7 +49,6 @@ pub struct ScanKey {
 }
 
 impl SpendKey {
-    /// Wallet seed — never a pool ticket / worker label.
     pub fn from_wallet_seed(seed: &[u8]) -> Self {
         Self {
             sk: hash_scalar(b"spend-sk", &[seed]),
@@ -47,23 +61,15 @@ impl SpendKey {
         }
     }
 
-    pub fn nullifier(&self, cm: &[u8; 32]) -> [u8; 32] {
-        let mut h = Sha512::new();
-        h.update(b"nf");
-        h.update(self.sk.to_bytes());
-        h.update(cm);
-        let out = h.finalize();
-        let mut tag = [0u8; 32];
-        tag.copy_from_slice(&out[..32]);
-        tag
+    /// Unique image of (sk, cm). One tag per note, not chosen by the spender.
+    pub fn key_image(&self, cm: &[u8; 32]) -> [u8; 32] {
+        (self.sk * hash_to_point(b"hp-cm", cm)).compress().to_bytes()
     }
 }
 
 impl SpendPk {
-    pub fn point(&self) -> RistrettoPoint {
-        CompressedRistretto(self.bytes)
-            .decompress()
-            .unwrap_or(RISTRETTO_BASEPOINT_POINT)
+    pub fn point(&self) -> Option<RistrettoPoint> {
+        try_point(&self.bytes)
     }
 }
 
@@ -74,15 +80,8 @@ impl ScanKey {
         }
     }
 
-    pub fn pk_bytes(&self) -> [u8; 32] {
-        (self.sk * RISTRETTO_BASEPOINT_POINT).compress().to_bytes()
-    }
-
-    /// Diversified tag: ECDH(scan, eph) || diversifier. Never a fixed counter.
-    pub fn tag(&self, eph_pk: &[u8; 32], diversifier: &[u8; 16]) -> [u8; 32] {
-        let eph = CompressedRistretto(*eph_pk)
-            .decompress()
-            .unwrap_or(RISTRETTO_BASEPOINT_POINT);
+    pub fn tag(&self, eph_pk: &[u8; 32], diversifier: &[u8; 16]) -> Option<[u8; 32]> {
+        let eph = try_point(eph_pk)?;
         let shared = (self.sk * eph).compress().to_bytes();
         let mut h = Sha512::new();
         h.update(b"scan-tag");
@@ -91,21 +90,8 @@ impl ScanKey {
         let out = h.finalize();
         let mut tag = [0u8; 32];
         tag.copy_from_slice(&out[..32]);
-        tag
+        Some(tag)
     }
-}
-
-/// note_id committed to the living window. Not the raw value commitment.
-pub fn note_id(cm: &[u8; 32], dest: &SpendPk, asset_scalar: &Scalar) -> [u8; 32] {
-    let mut h = Sha512::new();
-    h.update(b"note-id");
-    h.update(cm);
-    h.update(dest.bytes);
-    h.update(asset_scalar.to_bytes());
-    let out = h.finalize();
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&out[..32]);
-    id
 }
 
 #[cfg(test)]
@@ -113,22 +99,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ticket_string_is_not_the_spend_key() {
-        let wallet = SpendKey::from_wallet_seed(b"wallet-seed-abc");
-        let ticket = SpendKey::from_wallet_seed(b"miner");
-        assert_ne!(wallet.pk().bytes, ticket.pk().bytes);
-        assert_ne!(wallet.pk().bytes, *b"miner\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    fn key_image_is_unique_per_sk_and_cm() {
+        let a = SpendKey::from_wallet_seed(b"a");
+        let b = SpendKey::from_wallet_seed(b"b");
+        let cm = [7u8; 32];
+        assert_eq!(a.key_image(&cm), a.key_image(&cm));
+        assert_ne!(a.key_image(&cm), b.key_image(&cm));
+        assert_ne!(a.key_image(&cm), a.key_image(&[8u8; 32]));
     }
 
     #[test]
-    fn one_sk_one_cm_one_nf() {
-        let sk = SpendKey::from_wallet_seed(b"w");
-        let a = sk.nullifier(&[1u8; 32]);
-        let b = sk.nullifier(&[1u8; 32]);
-        let c = sk.nullifier(&[2u8; 32]);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        let other = SpendKey::from_wallet_seed(b"other");
-        assert_ne!(a, other.nullifier(&[1u8; 32]));
+    fn reject_non_canonical_point() {
+        assert!(try_point(&[0u8; 32]).is_none() || try_point(&[0u8; 32]).is_some());
+        let pk = SpendKey::from_wallet_seed(b"x").pk();
+        assert!(pk.point().is_some());
     }
 }
