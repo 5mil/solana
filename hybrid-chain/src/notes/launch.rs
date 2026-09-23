@@ -1,15 +1,12 @@
-//! Living set: sorted window for decoys, full history stays spendable.
-//! Pads are uniform Ristretto points with no known opening.
+//! Living set is the current window. Dropped notes must already have
+//! been spent into a new window note. No history-as-decoy split.
 
-use super::auth::RING;
-use super::tree::merkle_root;
+use super::tree::{merkle_root, NoteCommitmentTree};
 use crate::consensus::pow::sha256d;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::VecDeque;
-
-pub const WINDOW_DEPTH: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProfileKind {
@@ -57,7 +54,6 @@ pub struct LaunchSet {
     pub profile: ProfileKind,
     live: Vec<[u8; 32]>,
     window: VecDeque<Vec<[u8; 32]>>,
-    history: Vec<[u8; 32]>,
     forest_acc: [u8; 32],
     sealed_count: u64,
 }
@@ -68,7 +64,6 @@ impl LaunchSet {
             profile,
             live: Vec::new(),
             window: VecDeque::new(),
-            history: Vec::new(),
             forest_acc: [0u8; 32],
             sealed_count: 0,
         }
@@ -78,19 +73,7 @@ impl LaunchSet {
         Self::new(ProfileKind::Standard)
     }
 
-    pub fn live_len(&self) -> usize {
-        self.live.len()
-    }
-
-    pub fn sealed_count(&self) -> u64 {
-        self.sealed_count
-    }
-
-    pub fn forest_acc(&self) -> [u8; 32] {
-        self.forest_acc
-    }
-
-    fn decoys(&self) -> Vec<[u8; 32]> {
+    fn leaves(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
         for epoch in &self.window {
             out.extend_from_slice(epoch);
@@ -99,14 +82,14 @@ impl LaunchSet {
         out
     }
 
-    fn sorted_window(&self) -> Vec<[u8; 32]> {
-        let mut leaves = self.decoys();
-        leaves.sort_unstable();
-        leaves
+    fn sorted(&self) -> Vec<[u8; 32]> {
+        let mut l = self.leaves();
+        l.sort_unstable();
+        l
     }
 
     pub fn window_root(&self) -> [u8; 32] {
-        merkle_root(&self.sorted_window())
+        merkle_root(&self.sorted())
     }
 
     pub fn commitment(&self) -> [u8; 32] {
@@ -118,12 +101,11 @@ impl LaunchSet {
     }
 
     pub fn contains(&self, leaf: [u8; 32]) -> bool {
-        self.history.iter().any(|l| *l == leaf) || self.live.iter().any(|l| *l == leaf)
+        self.leaves().iter().any(|l| *l == leaf)
     }
 
     pub fn append(&mut self, leaf: [u8; 32]) {
         self.live.push(leaf);
-        self.history.push(leaf);
         if self.live.len() >= self.profile.cap() {
             self.seal();
         }
@@ -150,48 +132,19 @@ impl LaunchSet {
         let bucket = self.profile.bucket();
         let mut i = self.live.len() as u64;
         while self.live.len() < bucket {
-            let p = pad_point(&self.forest_acc, self.sealed_count, i);
-            self.live.push(p);
-            self.history.push(p);
+            self.live.push(pad_point(&self.forest_acc, self.sealed_count, i));
             i += 1;
         }
     }
 
-    /// Deterministic ring: real cm plus decoys from the living window.
-    /// Archive notes stay spendable (history) without a refresh holiday.
-    pub fn sample_ring(&self, real: [u8; 32], seed: &[u8]) -> Option<(Vec<[u8; 32]>, usize)> {
-        if !self.contains(real) {
-            return None;
+    pub fn prove_window(&self, note_id: [u8; 32]) -> Option<(usize, Vec<[u8; 32]>)> {
+        let sorted = self.sorted();
+        let index = sorted.iter().position(|l| *l == note_id)?;
+        let mut t = NoteCommitmentTree::new();
+        for l in &sorted {
+            t.append(*l);
         }
-        let mut decoys: Vec<[u8; 32]> = self
-            .decoys()
-            .into_iter()
-            .filter(|c| *c != real)
-            .collect();
-        decoys.sort_unstable();
-        let mut ring = Vec::with_capacity(RING);
-        ring.push(real);
-        let mut i = 0u64;
-        while ring.len() < RING && !decoys.is_empty() {
-            let mut buf = seed.to_vec();
-            buf.extend_from_slice(&i.to_le_bytes());
-            let h = sha256d(&buf);
-            let idx = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize % decoys.len();
-            let pick = decoys.remove(idx);
-            if !ring.contains(&pick) {
-                ring.push(pick);
-            }
-            i += 1;
-            if i > 1024 {
-                break;
-            }
-        }
-        while ring.len() < RING {
-            ring.push(real);
-        }
-        ring.sort_unstable();
-        let index = ring.iter().position(|c| *c == real)?;
-        Some((ring, index))
+        Some((index, t.proof(index)?))
     }
 }
 
@@ -207,43 +160,28 @@ fn pad_point(acc: &[u8; 32], sealed: u64, i: u64) -> [u8; 32] {
     RistrettoPoint::from_uniform_bytes(&wide).compress().to_bytes()
 }
 
-pub fn needs_refresh(_set: &LaunchSet, _leaf: [u8; 32]) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn pads_are_curve_points() {
-        let p = pad_point(&[7u8; 32], 0, 1);
-        assert!(curve25519_dalek::ristretto::CompressedRistretto(p)
-            .decompress()
-            .is_some());
-    }
-
-    #[test]
-    fn history_survives_window_roll() {
+    fn dropped_epoch_is_not_spendable() {
         let mut s = LaunchSet::new(ProfileKind::Constrained);
         let first = [42u8; 32];
         s.append(first);
         s.seal();
-        for e in 0..ProfileKind::Constrained.window_epochs() + 2 {
+        for e in 0..ProfileKind::Constrained.window_epochs() + 1 {
             s.append([(e + 3) as u8; 32]);
             s.seal();
         }
-        assert!(s.contains(first));
-        assert!(!needs_refresh(&s, first));
-        let (ring, idx) = s.sample_ring(first, b"seed").unwrap();
-        assert_eq!(ring.len(), RING);
-        assert_eq!(ring[idx], first);
+        assert!(!s.contains(first));
+        assert!(s.prove_window(first).is_none());
     }
 
     #[test]
-    fn commitment_binds_profile() {
-        let a = LaunchSet::new(ProfileKind::Standard);
-        let b = LaunchSet::new(ProfileKind::Dense);
-        assert_ne!(a.commitment(), b.commitment());
+    fn live_note_has_path() {
+        let mut s = LaunchSet::standard();
+        s.append([7u8; 32]);
+        assert!(s.prove_window([7u8; 32]).is_some());
     }
 }
