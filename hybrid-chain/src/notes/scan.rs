@@ -39,15 +39,16 @@ impl TagIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notes::action::coinbase_bundle;
-    use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
+    use crate::notes::action::{coinbase_bundle, emission_blinding, emission_commitment};
+    use crate::notes::auth::RangeProof;
     use crate::notes::payout::discovery_tag;
 
     #[test]
     fn finds_own_tag_only() {
-        let gens = PedersenGenerators::default();
-        let c = ValueCommitment::commit(1, &blinding_from_seed(b"r"), &gens);
-        let b = coinbase_bundle([7u8; 32], b"scan-seed", c, [0u8; 32]);
+        let dest = [7u8; 32];
+        let r = emission_blinding(&dest, 1);
+        let c = emission_commitment(&dest, 1, 1);
+        let b = coinbase_bundle(dest, b"scan-seed", c, [0u8; 32], RangeProof::prove(1, &r));
         let mut idx = TagIndex::new();
         idx.ingest(1, &b);
         let mine = discovery_tag(b"scan-seed", 0);
