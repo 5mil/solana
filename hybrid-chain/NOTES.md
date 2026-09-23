@@ -1,9 +1,12 @@
-# Living-set notes (`dev`)
+# Living-set notes (`dev`) — post-review executive cut
 
-- dest = sk·G. nf = Hash(sk || cm). Tickets cannot spend.
-- Membership is a window path against live_root. No listed ring.
-- Living set = stored window. Dropped notes are not spendable.
-- Emission is an OR among padded outputs for schedule(h), not a dest-tagged point.
-- Scan tags use eph_pk + diversifier. Asset is inside cm (generator A).
-- Block codec is header + compact bundles only.
-- One NoteProof object: SpendAuth + WindowPath + BindingSig.
+Addressed from the independent review:
+
+- Dest is not on SpendAuth / NoteProof. Tag is a key image I = sk·Hp(cm).
+- ImageOr binds I and C′ to a window-only ring (C′ is a rerandomization of one live cm).
+- Ranges sit inside NoteProof (in/out/fee).
+- Fiat–Shamir contexts include live_root, height, ring, image, C′.
+- mine_pow_with_payout(ticket, wallet). Ticket is not the seed.
+- Emission OR stores reward+height; slot is not hard-coded 0.
+- Scan refuses non-canonical eph (try_point).
+- Persist rebuilds PoS emission from proof.reward.
