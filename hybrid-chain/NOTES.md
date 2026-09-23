@@ -16,17 +16,18 @@ Production-path increment. Reward amounts remain on the classic coinbase for sch
 - Stake proof binds a committed note
 - Pool stores ticket_hash, not dest
 - Persist rebuilds tree+tags and refuses flipped leaves / roots / bad membership
-- Bounded-epoch forest (`epoch.rs`) — capped prover work
-- **Launch set** (`launch.rs`): hidden window proof, adaptive profiles, pad-to-bucket, folded 32-byte acc, refresh-or-drop
+- Bounded-epoch forest (`epoch.rs`)
+- Launch set on the node (`Blockchain.launch`)
 
-## Launch vs full-chain membership
+## Five-step cutover (this increment)
 
-- Spends use `HiddenProof` (no `epoch_index` / `epoch_root` on the wire).
-- Window leaves are **sorted** before the Merkle root, so path rank is not age.
-- Seal pads every epoch to the profile bucket — sparse and dense look the same.
-- `ProfileKind::recommend(notes/hour, ram)` picks Constrained / Sparse / Standard / Dense.
-- `forest_acc` folds each sealed epoch; commitment is `H(window_root || forest_acc)`.
-- Notes that roll off the window must refresh into live. Verify stays bounded at any chain length.
+1. `Blockchain.launch: LaunchSet` — every compact output is appended to the window.
+2. `verify_bundle_against` accepts `HiddenProof` against `window_root`.
+3. `rebuild_notes` + persist load replay the launch set; commitment must match.
+4. Spends whose leaf is not in the window are refused (`spend outside window`).
+5. Tests: hidden spend + mine, replay refused, persist after hidden spend, out-of-window prove is `None`.
+
+`header.notes_root` is still the live-tree root so existing snapshots keep their formula.
 
 ## Still not production-complete
 
@@ -37,4 +38,3 @@ Production-path increment. Reward amounts remain on the classic coinbase for sch
 - Hardware signing
 - Explorer-visible amounts fully gone
 - coinbase bool still a bundle fingerprint
-- Blockchain.notes still the live tree; LaunchSet is the spend path to cut over
