@@ -1,42 +1,41 @@
-//! Stake eligibility as a note statement. Stake size stays in a commitment.
+//! Stake is a committed note. Coins never appear on the minted block API.
 
 use super::commitment::{PedersenGenerators, ValueCommitment};
-use super::membership::MembershipProof;
-use super::tree::NoteCommitmentTree;
-use crate::consensus::pos::validate_stake;
+use super::launch::LaunchSet;
+use crate::consensus::pos::{pos_reward, validate_stake};
 use curve25519_dalek::scalar::Scalar;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StakeProof {
-    pub membership: MembershipProof,
     pub stake_commitment: ValueCommitment,
     pub seconds_held: u64,
+    #[serde(skip)]
+    coins: u64,
 }
 
 impl StakeProof {
     pub fn create(
-        tree: &NoteCommitmentTree,
-        leaf_index: usize,
+        launch: &LaunchSet,
         coins: u64,
         blinding: &Scalar,
         seconds_held: u64,
     ) -> Result<Self, &'static str> {
         validate_stake(coins, seconds_held)?;
-        let membership = MembershipProof::prove(tree, leaf_index).ok_or("stake leaf missing")?;
         let gens = PedersenGenerators::default();
         let stake_commitment = ValueCommitment::commit(coins, blinding, &gens);
-        if stake_commitment.commitment != membership.leaf {
-            return Err("stake commitment is not the tree leaf");
-        }
-        if !membership.verify(tree.root()) {
-            return Err("stake membership failed");
+        if !launch.contains(stake_commitment.commitment) {
+            return Err("stake note not in living set");
         }
         Ok(Self {
-            membership,
             stake_commitment,
             seconds_held,
+            coins,
         })
+    }
+
+    pub fn reward(&self) -> u64 {
+        pos_reward(self.coins, self.seconds_held)
     }
 }
 
@@ -44,19 +43,22 @@ impl StakeProof {
 mod tests {
     use super::*;
     use crate::notes::commitment::blinding_from_seed;
+    use crate::notes::launch::LaunchSet;
     use crate::params::CHAIN_PARAMS;
+    use serde_json;
 
     #[test]
-    fn stake_note_does_not_publish_coins_in_proof_fields_besides_commitment() {
+    fn serialized_stake_omits_coins() {
         let r = blinding_from_seed(b"stake");
         let gens = PedersenGenerators::default();
         let coins = CHAIN_PARAMS.min_stake;
         let c = ValueCommitment::commit(coins, &r, &gens);
-        let mut tree = NoteCommitmentTree::new();
-        tree.append(c.commitment);
-        let p = StakeProof::create(&tree, 0, coins, &r, CHAIN_PARAMS.pos_coin_age_min + 3600)
+        let mut set = LaunchSet::standard();
+        set.append(c.commitment);
+        let p = StakeProof::create(&set, coins, &r, CHAIN_PARAMS.pos_coin_age_min + 3600)
             .expect("ok");
-        assert_eq!(p.stake_commitment, c);
-        assert!(p.membership.verify(tree.root()));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains(&coins.to_string()));
+        assert_eq!(p.reward(), pos_reward(coins, CHAIN_PARAMS.pos_coin_age_min + 3600));
     }
 }
