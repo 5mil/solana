@@ -1,4 +1,4 @@
-//! Living set = current window of commitments. Ring decoys only from here.
+//! Living set = current window of commitments.
 
 use super::auth::RING;
 use super::tree::{merkle_root, NoteCommitmentTree};
@@ -33,9 +33,7 @@ impl ProfileKind {
             Self::Dense => 32,
         }
     }
-    pub fn bucket(self) -> usize {
-        self.cap()
-    }
+    pub fn bucket(self) -> usize { self.cap() }
     pub fn id(self) -> u8 {
         match self {
             Self::Constrained => 1,
@@ -57,33 +55,21 @@ pub struct LaunchSet {
 
 impl LaunchSet {
     pub fn new(profile: ProfileKind) -> Self {
-        Self {
-            profile,
-            live: Vec::new(),
-            window: VecDeque::new(),
-            forest_acc: [0u8; 32],
-            sealed_count: 0,
-        }
+        Self { profile, live: Vec::new(), window: VecDeque::new(), forest_acc: [0u8; 32], sealed_count: 0 }
     }
-    pub fn standard() -> Self {
-        Self::new(ProfileKind::Standard)
-    }
-    fn leaves(&self) -> Vec<[u8; 32]> {
+    pub fn standard() -> Self { Self::new(ProfileKind::Standard) }
+    pub fn live_leaves(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
-        for epoch in &self.window {
-            out.extend_from_slice(epoch);
-        }
+        for epoch in &self.window { out.extend_from_slice(epoch); }
         out.extend_from_slice(&self.live);
         out
     }
     fn sorted(&self) -> Vec<[u8; 32]> {
-        let mut l = self.leaves();
+        let mut l = self.live_leaves();
         l.sort_unstable();
         l
     }
-    pub fn window_root(&self) -> [u8; 32] {
-        merkle_root(&self.sorted())
-    }
+    pub fn window_root(&self) -> [u8; 32] { merkle_root(&self.sorted()) }
     pub fn commitment(&self) -> [u8; 32] {
         let mut c = Vec::with_capacity(65);
         c.extend_from_slice(&self.window_root());
@@ -92,18 +78,14 @@ impl LaunchSet {
         sha256d(&c)
     }
     pub fn contains(&self, leaf: [u8; 32]) -> bool {
-        self.leaves().iter().any(|l| *l == leaf)
+        self.live_leaves().iter().any(|l| *l == leaf)
     }
     pub fn append(&mut self, leaf: [u8; 32]) {
         self.live.push(leaf);
-        if self.live.len() >= self.profile.cap() {
-            self.seal();
-        }
+        if self.live.len() >= self.profile.cap() { self.seal(); }
     }
     pub fn seal(&mut self) {
-        if self.live.is_empty() {
-            return;
-        }
+        if self.live.is_empty() { return; }
         self.pad_live();
         let epoch_root = merkle_root(&self.live);
         let mut acc = Vec::with_capacity(64);
@@ -112,9 +94,7 @@ impl LaunchSet {
         self.forest_acc = sha256d(&acc);
         self.window.push_back(std::mem::take(&mut self.live));
         self.sealed_count += 1;
-        while self.window.len() > self.profile.window_epochs() {
-            self.window.pop_front();
-        }
+        while self.window.len() > self.profile.window_epochs() { self.window.pop_front(); }
     }
     fn pad_live(&mut self) {
         let bucket = self.profile.bucket();
@@ -128,16 +108,12 @@ impl LaunchSet {
         let sorted = self.sorted();
         let index = sorted.iter().position(|l| *l == leaf)?;
         let mut t = NoteCommitmentTree::new();
-        for l in &sorted {
-            t.append(*l);
-        }
+        for l in &sorted { t.append(*l); }
         Some((index, t.proof(index)?))
     }
     pub fn sample_ring(&self, real: [u8; 32], seed: &[u8]) -> Option<(Vec<[u8; 32]>, usize)> {
-        if !self.contains(real) {
-            return None;
-        }
-        let mut decoys: Vec<[u8; 32]> = self.leaves().into_iter().filter(|c| *c != real).collect();
+        if !self.contains(real) { return None; }
+        let mut decoys: Vec<[u8; 32]> = self.live_leaves().into_iter().filter(|c| *c != real).collect();
         decoys.sort_unstable();
         let mut ring = vec![real];
         let mut i = 0u64;
@@ -147,17 +123,11 @@ impl LaunchSet {
             let h = sha256d(&buf);
             let idx = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize % decoys.len();
             let pick = decoys.remove(idx);
-            if !ring.contains(&pick) {
-                ring.push(pick);
-            }
+            if !ring.contains(&pick) { ring.push(pick); }
             i += 1;
-            if i > 2048 {
-                break;
-            }
+            if i > 2048 { break; }
         }
-        while ring.len() < RING {
-            ring.push(real);
-        }
+        while ring.len() < RING { ring.push(real); }
         ring.sort_unstable();
         let index = ring.iter().position(|c| *c == real)?;
         Some((ring, index))
