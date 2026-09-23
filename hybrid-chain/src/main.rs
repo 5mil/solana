@@ -19,90 +19,42 @@ fn default_data_path() -> PathBuf {
 fn print_banner() {
     println!("=== Hybrid SHA256d PoW/PoS Node ===");
     println!("Chain: {}", CHAIN_PARAMS.name);
-    println!("Ticker: {}", CHAIN_PARAMS.ticker);
-    println!("Max Supply: {} coins", CHAIN_PARAMS.max_supply);
-    println!("Default pool: {}", DefaultPool::name());
-    println!("Notes: nullifier spends + living set + range + binding");
+    println!("Notes: spend-key + window membership + compact-only blocks");
 }
 
 fn mine_and_persist(path: &Path) {
     print_banner();
     let mut blockchain = Blockchain::new();
-    println!(
-        "\nGenesis block created: {}",
-        hex::encode(blockchain.tip_hash())
-    );
-    println!(
-        "Genesis live root: {}",
-        hex::encode(blockchain.launch.commitment())
-    );
-
     let pool = DefaultPool::new();
-    let miner = "miner_address_here";
-    let pow_block = blockchain.mine_pow_block(miner);
-    let sealed = SealedPayout::from_ticket(miner.as_bytes(), pow_block.header.height);
-    println!(
-        "Mined PoW block #{}: {}",
-        pow_block.header.height,
-        hex::encode(pow_block.hash())
-    );
-    println!(
-        "Sealed payout dest: {}",
-        hex::encode(sealed.dest)
-    );
-    println!(
-        "notes_root={} tags_root={}",
-        hex::encode(pow_block.header.notes_root),
-        hex::encode(pow_block.header.tags_root)
-    );
-
-    match pool.submit_block(miner, &pow_block) {
-        Ok(share) => println!(
-            "Accepted by {}: height={} nonce={} hash={}",
-            DefaultPool::name(),
-            share.height,
-            share.nonce,
-            hex::encode(share.hash)
-        ),
+    let seed = "miner-wallet-seed";
+    let pow_block = blockchain.mine_pow_block(seed);
+    let sealed = SealedPayout::from_wallet_seed(seed.as_bytes(), pow_block.header.height);
+    println!("PoW #{} {}", pow_block.header.height, hex::encode(pow_block.hash()));
+    println!("dest pk {}", hex::encode(sealed.dest.bytes));
+    match pool.submit_block(seed, &pow_block) {
+        Ok(share) => println!("pool accepted height={}", share.height),
         Err(e) => {
-            println!("Pool rejected share: {:?}", e);
+            println!("pool rejected: {:?}", e);
             process::exit(1);
         }
     }
-
     blockchain.save_to_path(path).unwrap_or_else(|e| {
-        eprintln!("failed to persist chain: {:?}", e);
+        eprintln!("{:?}", e);
         process::exit(1);
     });
-    println!("Persisted chain to {}", path.display());
 }
 
 fn replay(path: &Path) {
     print_banner();
-    println!("\nReplaying chain from {}", path.display());
     let chain = Blockchain::load_from_path(path).unwrap_or_else(|e| {
-        eprintln!("failed to load chain: {:?}", e);
+        eprintln!("{:?}", e);
         process::exit(1);
     });
     chain.revalidate().unwrap_or_else(|e| {
-        eprintln!("revalidation failed: {:?}", e);
+        eprintln!("{:?}", e);
         process::exit(1);
     });
-    println!(
-        "Revalidated {} blocks. Tip: {}",
-        chain.height(),
-        hex::encode(chain.tip_hash())
-    );
-    if chain.height() < 2 {
-        eprintln!("expected at least genesis + one PoW block");
-        process::exit(1);
-    }
-    let pow = &chain.blocks[1];
-    println!(
-        "Stored PoW block #{} still valid: {}",
-        pow.header.height,
-        hex::encode(pow.hash())
-    );
+    println!("revalidated {} blocks", chain.height());
 }
 
 fn main() {
@@ -114,7 +66,6 @@ fn main() {
         .find(|w| w[0] == "--data")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(default_data_path);
-
     if replay_mode {
         replay(&data_path);
     } else {
