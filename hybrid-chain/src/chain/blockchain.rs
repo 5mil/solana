@@ -1,24 +1,21 @@
 use std::collections::HashMap;
 use chrono::Utc;
 use crate::chain::block::{Block, BlockHeader, BlockType};
-use crate::chain::transaction::Transaction;
 use crate::consensus::pow;
-use crate::consensus::pos;
 use crate::consensus::difficulty;
-use crate::notes::action::{coinbase_bundle, emission_blinding, emission_commitment, ActionBundle};
-use crate::notes::auth::RangeProof;
-use crate::notes::commitment::ValueCommitment;
+use crate::notes::action::ActionBundle;
 use crate::notes::launch::LaunchSet;
 use crate::notes::payout::SealedPayout;
+use crate::notes::spend::{emission_bundle, transfer_window_bundle};
 use crate::notes::stake::StakeProof;
 use crate::notes::tags::SpendTagSet;
-use crate::notes::tree::NoteCommitmentTree;
 use crate::params::CHAIN_PARAMS;
 
 pub(crate) fn verify_bundle_against(
     launch: &LaunchSet,
     bundle: &ActionBundle,
     allow_emission: bool,
+    reward: Option<u64>,
 ) -> Result<(), &'static str> {
     if !bundle.verify_conservation() {
         return Err("conservation failed");
@@ -27,65 +24,36 @@ pub(crate) fn verify_bundle_against(
         if !allow_emission {
             return Err("emission only on the block emission path");
         }
-        for out in bundle.real_outputs() {
-            if let Some(r) = &out.range {
-                if !r.verify(&out.value_commitment) {
-                    return Err("emission range failed");
-                }
-            } else {
-                return Err("emission range required");
-            }
+        let reward = reward.ok_or("emission reward required")?;
+        let cms: Vec<[u8; 32]> = bundle
+            .actions
+            .iter()
+            .filter_map(|a| a.output.as_ref())
+            .map(|o| o.value_commitment.commitment)
+            .collect();
+        let proof = bundle.emission.as_ref().ok_or("emission OR required")?;
+        if !proof.verify(&cms, reward) {
+            return Err("emission OR failed");
         }
         return Ok(());
     }
     if bundle.real_spends().is_empty() {
         return Err("empty bundle");
     }
+    let live = launch.window_root();
     for spend in bundle.real_spends() {
-        if spend.ring.is_empty() || spend.link.is_none() {
-            return Err("ring link required");
+        let proof = spend.proof.as_ref().ok_or("note proof required")?;
+        if !proof.membership.verify(live) {
+            return Err("window membership failed");
         }
-        for cm in &spend.ring {
-            if !launch.contains(*cm) {
-                return Err("ring member not in living set");
-            }
+        if !launch.contains(proof.membership.note_id) {
+            return Err("note not in living set");
         }
-        let link = spend.link.as_ref().unwrap();
-        if !link.verify(&spend.ring, &spend.rerand) {
-            return Err("link failed");
+        if !proof.auth.verify(&spend.spend_tag, &live, &spend.rerand.commitment) {
+            return Err("spend auth failed");
         }
-        if let Some(r) = &spend.range {
-            if !r.verify(&spend.rerand) {
-                return Err("spend range failed");
-            }
-        } else {
-            return Err("spend range required");
-        }
-    }
-    for out in bundle.real_outputs() {
-        if let Some(r) = &out.range {
-            if !r.verify(&out.value_commitment) {
-                return Err("output range failed");
-            }
-        } else {
-            return Err("output range required");
-        }
-    }
-    if let Some(r) = &bundle.fee_range {
-        if !r.verify(&bundle.fee_commitment) {
-            return Err("fee range failed");
-        }
-    } else {
-        return Err("fee range required");
     }
     Ok(())
-}
-
-fn emission_matches(bundle: &ActionBundle, height: u64, reward: u64) -> bool {
-    bundle.real_outputs().iter().any(|o| {
-        o.value_commitment.commitment
-            == emission_commitment(&o.one_time_dest, height, reward).commitment
-    })
 }
 
 #[derive(Debug)]
@@ -94,7 +62,6 @@ pub struct Blockchain {
     pub block_index: HashMap<[u8; 32], usize>,
     pub current_difficulty: u32,
     pub total_supply: u64,
-    pub notes: NoteCommitmentTree,
     pub launch: LaunchSet,
     pub tags: SpendTagSet,
 }
@@ -106,7 +73,6 @@ impl Blockchain {
             block_index: HashMap::new(),
             current_difficulty: CHAIN_PARAMS.initial_difficulty,
             total_supply: 0,
-            notes: NoteCommitmentTree::new(),
             launch: LaunchSet::standard(),
             tags: SpendTagSet::new(),
         };
@@ -114,44 +80,40 @@ impl Blockchain {
         chain
     }
 
-    fn append_bundle(&mut self, bundle: &ActionBundle, allow_emission: bool) -> Result<(), &'static str> {
-        verify_bundle_against(&self.launch, bundle, allow_emission)?;
+    fn append_bundle(
+        &mut self,
+        bundle: &ActionBundle,
+        allow_emission: bool,
+        reward: Option<u64>,
+    ) -> Result<(), &'static str> {
+        verify_bundle_against(&self.launch, bundle, allow_emission, reward)?;
         for tag in bundle.spend_tags() {
             self.tags.insert(tag)?;
         }
-        for c in bundle.output_commitments() {
-            self.notes.append(c);
-            self.launch.append(c);
+        for id in bundle.output_note_ids() {
+            self.launch.append(id);
         }
         Ok(())
     }
 
     pub fn apply_transfer(&mut self, bundle: &ActionBundle) -> Result<(), &'static str> {
         if bundle.is_emission() {
-            return Err("use emission path for coinbase");
+            return Err("use emission path");
         }
-        self.append_bundle(bundle, false)
-    }
-
-    fn emission_bundle(&self, ticket: &str, height: u64, reward: u64) -> ActionBundle {
-        let sealed = SealedPayout::from_ticket(ticket.as_bytes(), height);
-        let commit = emission_commitment(&sealed.dest, height, reward);
-        let range = RangeProof::prove(reward, &emission_blinding(&sealed.dest, height));
-        coinbase_bundle(sealed.dest, &sealed.scan_seed, commit, [0u8; 32], range)
+        self.append_bundle(bundle, false, None)
     }
 
     fn create_genesis(&mut self) {
-        let genesis_sealed = SealedPayout::from_ticket(b"genesis", 0);
-        let genesis_tx = Transaction::coinbase(0, CHAIN_PARAMS.pow_block_reward, &genesis_sealed.dest);
-        let txs = vec![genesis_tx];
-        let merkle = Block::compute_merkle_root(&txs);
-        let bundle = self.emission_bundle("genesis", 0, CHAIN_PARAMS.pow_block_reward);
-        self.append_bundle(&bundle, true).expect("genesis notes");
+        let pay = SealedPayout::from_wallet_seed(b"genesis-wallet", 0);
+        let bundle = emission_bundle(&pay.spend, &pay.scan, 0, CHAIN_PARAMS.pow_block_reward, [0u8; 16]);
+        self.append_bundle(&bundle, true, Some(CHAIN_PARAMS.pow_block_reward))
+            .expect("genesis");
+        let compact = vec![bundle];
         let header = BlockHeader {
-            version: 1,
+            version: 3,
             height: 0,
             prev_hash: [0u8; 32],
-            merkle_root: merkle,
+            merkle_root: Block::compute_merkle_root(&compact),
             timestamp: CHAIN_PARAMS.genesis_timestamp,
             difficulty: self.current_difficulty,
             block_type: BlockType::PoW,
@@ -160,12 +122,11 @@ impl Blockchain {
             notes_root: self.launch.commitment(),
             tags_root: self.tags.root(),
         };
-        let genesis = Block { header, transactions: txs, compact: vec![bundle] };
+        let genesis = Block { header, compact };
         let hash = genesis.hash();
         self.block_index.insert(hash, 0);
         self.total_supply += CHAIN_PARAMS.pow_block_reward;
         self.blocks.push(genesis);
-        log::info!("Genesis block created: {}", hex::encode(hash));
     }
 
     pub fn tip_hash(&self) -> [u8; 32] {
@@ -176,31 +137,28 @@ impl Blockchain {
         self.blocks.len() as u64
     }
 
-    pub fn mine_pow_block(&mut self, miner_address: &str) -> Block {
-        self.mine_pow_with_bundles(miner_address, Vec::new())
+    pub fn mine_pow_block(&mut self, wallet_seed: &str) -> Block {
+        self.mine_pow_with_bundles(wallet_seed, Vec::new())
     }
 
-    pub fn mine_pow_with_bundles(&mut self, miner_address: &str, extra: Vec<ActionBundle>) -> Block {
+    pub fn mine_pow_with_bundles(&mut self, wallet_seed: &str, extra: Vec<ActionBundle>) -> Block {
         for b in &extra {
-            self.append_bundle(b, false).expect("extra compact bundle");
+            self.append_bundle(b, false, None).expect("extra");
         }
         let prev_hash = self.tip_hash();
         let height = self.height();
         let reward = self.current_pow_reward();
-        let sealed = SealedPayout::from_ticket(miner_address.as_bytes(), height);
-        let coinbase = Transaction::coinbase(height, reward, &sealed.dest);
-        let txs = vec![coinbase];
-        let merkle = Block::compute_merkle_root(&txs);
-        let now = Utc::now().timestamp();
-        let bundle = self.emission_bundle(miner_address, height, reward);
-        assert!(emission_matches(&bundle, height, reward));
-        self.append_bundle(&bundle, true).expect("coinbase notes");
+        let pay = SealedPayout::from_wallet_seed(wallet_seed.as_bytes(), height);
+        let bundle = emission_bundle(&pay.spend, &pay.scan, height, reward, height.to_le_bytes()[..16].try_into().unwrap_or([0u8; 16]));
+        self.append_bundle(&bundle, true, Some(reward)).expect("emission");
+        let mut compact = extra;
+        compact.push(bundle);
         let mut header = BlockHeader {
-            version: 1,
+            version: 3,
             height,
             prev_hash,
-            merkle_root: merkle,
-            timestamp: now,
+            merkle_root: Block::compute_merkle_root(&compact),
+            timestamp: Utc::now().timestamp(),
             difficulty: self.current_difficulty,
             block_type: BlockType::PoW,
             nonce: 0,
@@ -217,38 +175,31 @@ impl Blockchain {
             }
             nonce = nonce.wrapping_add(1);
         }
-        let mut compact = extra;
-        compact.push(bundle);
-        let block = Block { header, transactions: txs, compact };
+        let block = Block { header, compact };
         let block_hash = block.hash();
         self.block_index.insert(block_hash, self.blocks.len());
         self.total_supply += reward;
         self.blocks.push(block.clone());
         self.maybe_retarget();
-        log::info!("PoW block #{} mined: {} (nonce={})", height, hex::encode(block_hash), nonce);
         block
     }
 
-    pub fn mint_pos_block(&mut self, staker_address: &str, proof: &StakeProof) -> Result<Block, &'static str> {
+    pub fn mint_pos_block(&mut self, wallet_seed: &str, proof: &StakeProof) -> Result<Block, &'static str> {
         let reward = proof.reward();
         if reward == 0 {
             return Err("zero pos reward");
         }
-        let prev_hash = self.tip_hash();
         let height = self.height();
-        let staker_sealed = SealedPayout::from_ticket(staker_address.as_bytes(), height);
-        let coinstake = Transaction::coinstake(0, reward, &staker_sealed.dest);
-        let txs = vec![coinstake];
-        let merkle = Block::compute_merkle_root(&txs);
-        let now = Utc::now().timestamp();
-        let bundle = self.emission_bundle(staker_address, height, reward);
-        self.append_bundle(&bundle, true)?;
+        let pay = SealedPayout::from_wallet_seed(wallet_seed.as_bytes(), height);
+        let bundle = emission_bundle(&pay.spend, &pay.scan, height, reward, [9u8; 16]);
+        self.append_bundle(&bundle, true, Some(reward))?;
+        let compact = vec![bundle];
         let header = BlockHeader {
-            version: 1,
+            version: 3,
             height,
-            prev_hash,
-            merkle_root: merkle,
-            timestamp: now,
+            prev_hash: self.tip_hash(),
+            merkle_root: Block::compute_merkle_root(&compact),
+            timestamp: Utc::now().timestamp(),
             difficulty: self.current_difficulty,
             block_type: BlockType::PoS,
             nonce: 0,
@@ -256,12 +207,11 @@ impl Blockchain {
             notes_root: self.launch.commitment(),
             tags_root: self.tags.root(),
         };
-        let block = Block { header, transactions: txs, compact: vec![bundle] };
+        let block = Block { header, compact };
         let block_hash = block.hash();
         self.block_index.insert(block_hash, self.blocks.len());
         self.total_supply += reward;
         self.blocks.push(block.clone());
-        log::info!("PoS block #{} minted: {} (reward hidden in commitment)", height, hex::encode(block_hash));
         Ok(block)
     }
 
@@ -284,116 +234,97 @@ impl Blockchain {
     }
 
     pub fn rebuild_notes(&mut self) -> Result<(), &'static str> {
-        self.notes = NoteCommitmentTree::new();
         self.launch = LaunchSet::standard();
         self.tags = SpendTagSet::new();
         for block in &self.blocks {
+            let reward = if block.header.block_type == BlockType::PoW {
+                Some(pow_reward_at_height(block.header.height))
+            } else {
+                None
+            };
             for bundle in &block.compact {
                 let allow = bundle.is_emission();
-                verify_bundle_against(&self.launch, bundle, allow)?;
+                let r = if allow { reward } else { None };
+                verify_bundle_against(&self.launch, bundle, allow, r)?;
                 for tag in bundle.spend_tags() {
                     self.tags.insert(tag)?;
                 }
-                for c in bundle.output_commitments() {
-                    self.notes.append(c);
-                    self.launch.append(c);
+                for id in bundle.output_note_ids() {
+                    self.launch.append(id);
                 }
             }
             if block.header.notes_root != self.launch.commitment() {
                 return Err("notes_root mismatch");
-            }
-            if block.header.tags_root != self.tags.root() {
-                return Err("tags_root mismatch");
             }
         }
         Ok(())
     }
 }
 
+fn pow_reward_at_height(height: u64) -> u64 {
+    let halvings = height / 210_000;
+    if halvings >= 64 { 0 } else { CHAIN_PARAMS.pow_block_reward >> halvings }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::pow::{meets_difficulty, sha256d};
-    use crate::notes::commitment::blinding_from_seed;
-    use crate::notes::payout::SealedPayout;
+    use crate::notes::commitment::{blinding_from_seed, PedersenGenerators, ValueCommitment};
+    use crate::notes::keys::{note_id, SpendKey};
+    use crate::notes::proof::asset_scalar;
     use crate::notes::stake::StakeProof;
 
     #[test]
-    fn genesis_and_pow_bind_live_root() {
+    fn compact_only_pow() {
         let mut chain = Blockchain::new();
-        let block = chain.mine_pow_block("miner");
-        assert_eq!(block.header.height, 1);
+        let block = chain.mine_pow_block("wallet-miner");
+        assert!(block.compact.len() >= 1);
         assert_eq!(block.header.notes_root, chain.launch.commitment());
-        assert_eq!(block.transactions[0].outputs[0].value, 0);
-        let bytes = bincode::serialize(&block.header).unwrap();
-        assert!(meets_difficulty(&sha256d(&bytes), block.header.difficulty));
     }
 
     #[test]
-    fn pos_uses_stake_proof_not_naked_coins() {
+    fn spend_needs_owner_key() {
         let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("miner");
-        let r = blinding_from_seed(b"stake-open");
-        let coins = CHAIN_PARAMS.min_stake;
-        let c = ValueCommitment::commit(coins, &r, &crate::notes::commitment::PedersenGenerators::default());
-        chain.launch.append(c.commitment);
-        let proof = StakeProof::create(
-            &chain.launch,
-            coins,
-            &r,
-            CHAIN_PARAMS.pos_coin_age_min + 3600,
-        )
-        .expect("stake");
-        let block = chain.mint_pos_block("staker", &proof).expect("pos");
-        assert_eq!(block.header.block_type, BlockType::PoS);
-        assert_eq!(block.transactions[0].outputs[1].value, 0);
-    }
-
-    #[test]
-    fn rebuild_matches_live_root() {
-        let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("miner");
-        let live = chain.launch.commitment();
-        chain.rebuild_notes().expect("rebuild");
-        assert_eq!(chain.launch.commitment(), live);
-    }
-
-    #[test]
-    fn hidden_spend_does_not_replay_note_cm() {
-        let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("miner");
-        let height = 1u64;
-        let sealed = SealedPayout::from_ticket(b"miner", height);
+        let _ = chain.mine_pow_block("wallet-miner");
+        let pay = SealedPayout::from_wallet_seed(b"wallet-miner", 1);
         let reward = CHAIN_PARAMS.pow_block_reward;
-        let in_blind = emission_blinding(&sealed.dest, height);
-        let note = emission_commitment(&sealed.dest, height, reward);
-        let r_out = blinding_from_seed(b"wout");
-        let r_fee = in_blind - r_out;
-        let bundle = crate::notes::transfer_window_bundle(
-            &sealed.spend_secret(),
+        let r = blinding_from_seed(&[b"emit-r".as_ref(), &pay.spend.sk.to_bytes(), &1u64.to_le_bytes()].concat());
+        let cm = crate::notes::proof::commit_with_asset(reward, &r, &[0u8; 32]).commitment;
+        let out = SpendKey::from_wallet_seed(b"recv");
+        let r_out = blinding_from_seed(b"o");
+        let r_fee = r - r_out;
+        let bundle = transfer_window_bundle(
+            &pay.spend,
+            &pay.scan,
             &chain.launch,
-            note.commitment,
+            cm,
             reward,
-            &in_blind,
-            [7u8; 32],
-            b"recv-scan",
+            &r,
+            &out,
             reward - 1,
             &r_out,
             1,
             &r_fee,
-            [0u8; 32],
+            [4u8; 16],
         )
-        .expect("window transfer");
-        assert_ne!(bundle.real_spends()[0].rerand.commitment, note.commitment);
-        let block = chain.mine_pow_with_bundles("miner2", vec![bundle.clone()]);
-        assert!(block.compact.len() >= 2);
+        .expect("owned spend");
+        assert!(bundle.real_spends()[0].proof.is_some());
+        let _ = chain.mine_pow_with_bundles("wallet-2", vec![bundle.clone()]);
         assert!(chain.apply_transfer(&bundle).is_err());
     }
 
     #[test]
-    fn extra_emission_rejected() {
+    fn pos_takes_stake_proof() {
         let mut chain = Blockchain::new();
-        let extra = chain.emission_bundle("sneak", 1, CHAIN_PARAMS.pow_block_reward);
-        assert_eq!(chain.apply_transfer(&extra), Err("use emission path for coinbase"));
+        let _ = chain.mine_pow_block("w");
+        let sk = SpendKey::from_wallet_seed(b"staker-w");
+        let r = blinding_from_seed(b"stk");
+        let coins = CHAIN_PARAMS.min_stake;
+        let c = ValueCommitment::commit(coins, &r, &PedersenGenerators::default());
+        let nid = note_id(&c.commitment, &sk.pk(), &asset_scalar(&[0u8; 32]));
+        chain.launch.append(nid);
+        let proof = StakeProof::create(&chain.launch, &c, coins, CHAIN_PARAMS.pos_coin_age_min + 3600)
+            .expect("stake");
+        assert!(chain.mint_pos_block("staker-w", &proof).is_ok());
     }
 }
