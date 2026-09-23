@@ -1,12 +1,10 @@
-# Living-set notes (`dev`) — post-review executive cut
+# Living-set notes (`dev`) — binding residual + window-wide membership
 
-Addressed from the independent review:
+Different system, not a padded RingCT:
 
-- Dest is not on SpendAuth / NoteProof. Tag is a key image I = sk·Hp(cm).
-- ImageOr binds I and C′ to a window-only ring (C′ is a rerandomization of one live cm).
-- Ranges sit inside NoteProof (in/out/fee).
-- Fiat–Shamir contexts include live_root, height, ring, image, C′.
-- mine_pow_with_payout(ticket, wallet). Ticket is not the seed.
-- Emission OR stores reward+height; slot is not hard-coded 0.
-- Scan refuses non-canonical eph (try_point).
-- Persist rebuilds PoS emission from proof.reward.
+- ImageOr is over every live leaf. The spend does not list decoys.
+- Conservation is BindingSig: ΣC = rH with r ≠ 0. Point-identity is rejected.
+- Every conserved C is ranged (C′, each output, fee). No dummy conservation leg.
+- Emission pad dest comes from the emission opening r, not the miner dest.
+- mine_pow_block(wallet_seed) derives dest from that seed, never from the tip.
+- Production mining is mine_pow_with_payout(ticket, &SealedPayout).
