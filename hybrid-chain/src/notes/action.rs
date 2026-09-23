@@ -95,20 +95,7 @@ impl ActionBundle {
         if inputs.is_empty() {
             return !outputs.is_empty() && is_identity(&self.fee_commitment);
         }
-        if !verify_balance(&inputs, &outputs, &self.fee_commitment) {
-            return false;
-        }
-        if let Some(sig) = &self.binding {
-            let mut t = Vec::new();
-            for s in self.real_spends() {
-                t.extend_from_slice(&s.spend_tag);
-            }
-            for o in self.real_outputs() {
-                t.extend_from_slice(&o.value_commitment.commitment);
-            }
-            return sig.verify(&inputs, &outputs, &self.fee_commitment, &t);
-        }
-        false
+        verify_balance(&inputs, &outputs, &self.fee_commitment)
     }
 
     pub fn output_commitments(&self) -> Vec<[u8; 32]> {
