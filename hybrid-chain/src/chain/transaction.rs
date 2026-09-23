@@ -8,6 +8,7 @@ pub struct TxInput {
     pub script_sig: Vec<u8>,
 }
 
+/// Classic output. `value` is always zero — amounts live in compact commitments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxOutput {
     pub value: u64,
@@ -29,7 +30,7 @@ impl Transaction {
         sha256d(&bytes)
     }
 
-    pub fn coinbase(block_height: u64, reward: u64, dest: &[u8]) -> Self {
+    pub fn coinbase(block_height: u64, _reward: u64, dest: &[u8]) -> Self {
         Transaction {
             version: 1,
             inputs: vec![TxInput {
@@ -38,7 +39,7 @@ impl Transaction {
                 script_sig: block_height.to_le_bytes().to_vec(),
             }],
             outputs: vec![TxOutput {
-                value: reward,
+                value: 0,
                 script_pubkey: dest.to_vec(),
             }],
             locktime: 0,
@@ -46,7 +47,7 @@ impl Transaction {
         }
     }
 
-    pub fn coinstake(stake_coins: u64, reward: u64, dest: &[u8]) -> Self {
+    pub fn coinstake(_stake_coins: u64, _reward: u64, dest: &[u8]) -> Self {
         Transaction {
             version: 1,
             inputs: vec![TxInput {
@@ -57,7 +58,7 @@ impl Transaction {
             outputs: vec![
                 TxOutput { value: 0, script_pubkey: vec![] },
                 TxOutput {
-                    value: stake_coins + reward,
+                    value: 0,
                     script_pubkey: dest.to_vec(),
                 },
             ],
