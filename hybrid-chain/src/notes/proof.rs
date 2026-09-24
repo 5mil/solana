@@ -234,9 +234,12 @@ impl NoteProof {
     pub fn verify(
         &self, image: &[u8; 32], c_prime: &ValueCommitment, outputs: &[ValueCommitment],
         fee: &ValueCommitment, launch: &LaunchSet, ctx: &[u8], transcript: &[u8],
+        pred_id: [u8; 32], pred_commit: [u8; 32],
     ) -> bool {
         if outputs.is_empty() || self.range_outs.len() != outputs.len() { return false; }
-        if !self.image.verify(&launch.live_leaves(), image, c_prime, ctx) { return false; }
+        let leaves = launch.live_leaves_for(pred_id, pred_commit);
+        if leaves.is_empty() { return false; }
+        if !self.image.verify(&leaves, image, c_prime, ctx) { return false; }
         if !self.range_in.verify(c_prime) { return false; }
         for (p, c) in self.range_outs.iter().zip(outputs.iter()) {
             if !p.verify(c) { return false; }
