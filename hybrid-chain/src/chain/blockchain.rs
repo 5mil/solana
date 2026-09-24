@@ -70,10 +70,13 @@ pub(crate) fn verify_bundle_against(
             launch,
             &ctx,
             &transcript,
+            spend.pred.id,
+            spend.pred.commit,
         ) {
             return Err("note proof failed");
         }
     }
+    bundle.verify_programs(height)?;
     Ok(())
 }
 
@@ -112,8 +115,8 @@ impl Blockchain {
         for tag in bundle.spend_tags() {
             self.tags.insert(tag)?;
         }
-        for c in bundle.output_commitments() {
-            self.launch.append(c);
+        for n in bundle.output_records() {
+            self.launch.append_note(n);
         }
         Ok(())
     }
@@ -283,8 +286,8 @@ impl Blockchain {
                 for tag in bundle.spend_tags() {
                     self.tags.insert(tag)?;
                 }
-                for c in bundle.output_commitments() {
-                    self.launch.append(c);
+                for n in bundle.output_records() {
+                    self.launch.append_note(n);
                 }
             }
             if block.header.notes_root != self.launch.commitment() {
@@ -335,21 +338,9 @@ mod tests {
         let r_out = blinding_from_seed(b"o");
         let r_fee = r - r_out;
         let bundle = transfer_window_bundle(
-            &pay.spend,
-            &pay.scan,
-            &chain.launch,
-            cm,
-            reward,
-            &r,
-            &out,
-            reward - 1,
-            &r_out,
-            1,
-            &r_fee,
-            [4u8; 16],
-            2,
-        )
-        .expect("owned spend");
+            &pay.spend, &pay.scan, &chain.launch, cm, reward, &r, &out,
+            reward - 1, &r_out, 1, &r_fee, [4u8; 16], 2,
+        ).expect("owned spend");
         let encoded = format!("{:?}", bundle.real_spends()[0].proof);
         assert!(!encoded.contains("dest"));
         assert!(!encoded.contains("ring:"));
