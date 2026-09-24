@@ -18,8 +18,8 @@ pub struct ChainParams {
 }
 
 pub const CHAIN_PARAMS: ChainParams = ChainParams {
-    name: "HybridChain",
-    ticker: "HYB",
+    name: "Orthal",
+    ticker: "ORTH",
     max_supply: 21_000_000,
     pow_block_reward: 50_0000_0000,
     pos_annual_rate: 0.05,
@@ -32,5 +32,5 @@ pub const CHAIN_PARAMS: ChainParams = ChainParams {
     pos_coin_age_max: 86400 * 90,
     initial_difficulty: 12,
     genesis_timestamp: 1748996400,
-    genesis_message: "HybridChain genesis - SHA256d PoW/PoS hybrid blockchain",
+    genesis_message: "Orthal genesis — compact notes, native ORTH",
 };
