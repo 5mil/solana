@@ -35,8 +35,7 @@ impl Blockchain {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| StoreError::Io(e.to_string()))?;
         }
-        let bytes =
-            bincode::serialize(&self.snapshot()).map_err(|e| StoreError::Io(e.to_string()))?;
+        let bytes = bincode::serialize(&self.snapshot()).map_err(|e| StoreError::Io(e.to_string()))?;
         fs::write(path, bytes).map_err(|e| StoreError::Io(e.to_string()))
     }
 
@@ -48,8 +47,7 @@ impl Blockchain {
         if bytes.is_empty() {
             return Err(StoreError::Decode("empty chain file".into()));
         }
-        let snap: ChainSnapshot =
-            bincode::deserialize(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?;
+        let snap: ChainSnapshot = bincode::deserialize(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?;
         if snap.blocks.is_empty() {
             return Err(StoreError::Invalid("empty snapshot".into()));
         }
@@ -66,9 +64,7 @@ impl Blockchain {
             chain.blocks.push(block);
         }
         chain.revalidate()?;
-        chain
-            .rebuild_notes()
-            .map_err(|e| StoreError::Invalid(e.to_string()))?;
+        chain.rebuild_notes().map_err(|e| StoreError::Invalid(e.to_string()))?;
         Ok(chain)
     }
 
@@ -93,8 +89,7 @@ impl Blockchain {
                 return Err(StoreError::Invalid(format!("bad parent at {i}")));
             }
             if block.header.block_type == BlockType::PoW {
-                let bytes = bincode::serialize(&block.header)
-                    .map_err(|e| StoreError::Decode(e.to_string()))?;
+                let bytes = bincode::serialize(&block.header).map_err(|e| StoreError::Decode(e.to_string()))?;
                 let hash = sha256d(&bytes);
                 if hash != block.hash() {
                     return Err(StoreError::Invalid(format!("hash mismatch at {i}")));
@@ -106,27 +101,19 @@ impl Blockchain {
             let reward = if block.header.block_type == BlockType::PoW {
                 Some(pow_reward_at_height(block.header.height))
             } else {
-                block
-                    .compact
-                    .iter()
-                    .find(|b| b.is_emission())
-                    .and_then(|b| b.emission.as_ref().map(|e| e.reward))
+                block.compact.iter().find(|b| b.is_emission()).and_then(|b| b.emission.as_ref().map(|e| e.reward))
             };
             for bundle in &block.compact {
                 crate::chain::blockchain::verify_bundle_against(
-                    &launch,
-                    bundle,
-                    bundle.is_emission(),
+                    &launch, bundle, bundle.is_emission(),
                     if bundle.is_emission() { reward } else { None },
                     block.header.height,
-                )
-                .map_err(|e| StoreError::Invalid(format!("bundle at {i}: {e}")))?;
+                ).map_err(|e| StoreError::Invalid(format!("bundle at {i}: {e}")))?;
                 for tag in bundle.spend_tags() {
-                    tags.insert(tag)
-                        .map_err(|e| StoreError::Invalid(format!("tag at {i}: {e}")))?;
+                    tags.insert(tag).map_err(|e| StoreError::Invalid(format!("tag at {i}: {e}")))?;
                 }
-                for c in bundle.output_commitments() {
-                    launch.append(c);
+                for n in bundle.output_records() {
+                    launch.append_note(n);
                 }
             }
             if block.header.notes_root != launch.commitment() {
@@ -139,11 +126,7 @@ impl Blockchain {
 
 fn pow_reward_at_height(height: u64) -> u64 {
     let halvings = height / 210_000;
-    if halvings >= 64 {
-        0
-    } else {
-        CHAIN_PARAMS.pow_block_reward >> halvings
-    }
+    if halvings >= 64 { 0 } else { CHAIN_PARAMS.pow_block_reward >> halvings }
 }
 
 #[cfg(test)]
@@ -151,14 +134,11 @@ mod tests {
     use super::*;
     use std::env;
     use std::sync::atomic::{AtomicU64, Ordering};
-
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
-
     fn isolated_path(label: &str) -> std::path::PathBuf {
         let n = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
         env::temp_dir().join(format!("hc-{}-{}-{}", label, std::process::id(), n))
     }
-
     #[test]
     fn persist_live_root() {
         let mut chain = Blockchain::new();
