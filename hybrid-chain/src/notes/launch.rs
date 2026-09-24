@@ -1,6 +1,5 @@
-//! Living set = current window of commitments.
+//! Living set = current window of commitments. No listed ring API.
 
-use super::auth::RING;
 use super::tree::{merkle_root, NoteCommitmentTree};
 use crate::consensus::pow::sha256d;
 use curve25519_dalek::ristretto::RistrettoPoint;
@@ -110,27 +109,6 @@ impl LaunchSet {
         let mut t = NoteCommitmentTree::new();
         for l in &sorted { t.append(*l); }
         Some((index, t.proof(index)?))
-    }
-    pub fn sample_ring(&self, real: [u8; 32], seed: &[u8]) -> Option<(Vec<[u8; 32]>, usize)> {
-        if !self.contains(real) { return None; }
-        let mut decoys: Vec<[u8; 32]> = self.live_leaves().into_iter().filter(|c| *c != real).collect();
-        decoys.sort_unstable();
-        let mut ring = vec![real];
-        let mut i = 0u64;
-        while ring.len() < RING && !decoys.is_empty() {
-            let mut buf = seed.to_vec();
-            buf.extend_from_slice(&i.to_le_bytes());
-            let h = sha256d(&buf);
-            let idx = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize % decoys.len();
-            let pick = decoys.remove(idx);
-            if !ring.contains(&pick) { ring.push(pick); }
-            i += 1;
-            if i > 2048 { break; }
-        }
-        while ring.len() < RING { ring.push(real); }
-        ring.sort_unstable();
-        let index = ring.iter().position(|c| *c == real)?;
-        Some((ring, index))
     }
 }
 
