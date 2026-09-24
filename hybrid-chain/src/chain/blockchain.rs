@@ -46,21 +46,26 @@ pub(crate) fn verify_bundle_against(
     ctx.extend_from_slice(&height.to_le_bytes());
     for spend in bundle.real_spends() {
         let proof = spend.proof.as_ref().ok_or("note proof required")?;
-        let outs = bundle.real_outputs();
-        let out_c = outs
-            .first()
+        let outs: Vec<_> = bundle
+            .real_outputs()
+            .into_iter()
             .map(|o| o.value_commitment.clone())
-            .ok_or("spend missing output")?;
+            .collect();
+        if outs.is_empty() {
+            return Err("spend missing output");
+        }
         let mut transcript = Vec::new();
         transcript.extend_from_slice(&spend.spend_tag);
-        transcript.extend_from_slice(&out_c.commitment);
+        for o in &outs {
+            transcript.extend_from_slice(&o.commitment);
+        }
         transcript.extend_from_slice(&bundle.fee_commitment.commitment);
         transcript.extend_from_slice(&launch.window_root());
         transcript.extend_from_slice(&height.to_le_bytes());
         if !proof.verify(
             &spend.spend_tag,
             &spend.rerand,
-            &out_c,
+            &outs,
             &bundle.fee_commitment,
             launch,
             &ctx,
@@ -155,7 +160,6 @@ impl Blockchain {
         self.blocks.len() as u64
     }
 
-    /// `ticket` is a pool label only. Payout keys come from `payout`, never the ticket.
     pub fn mine_pow_with_payout(
         &mut self,
         _ticket: &str,
@@ -203,15 +207,14 @@ impl Blockchain {
         block
     }
 
-    pub fn mine_pow_block(&mut self, ticket: &str) -> Block {
-        let pay = SealedPayout::from_wallet_seed(b"independent-dev-wallet", self.height());
-        let _ = ticket;
-        self.mine_pow_with_payout(ticket, &pay, Vec::new())
+    pub fn mine_pow_block(&mut self, wallet_seed: &str) -> Block {
+        let pay = SealedPayout::from_wallet_seed(wallet_seed.as_bytes(), self.height());
+        self.mine_pow_with_payout("local", &pay, Vec::new())
     }
 
-    pub fn mine_pow_with_bundles(&mut self, ticket: &str, extra: Vec<ActionBundle>) -> Block {
-        let pay = SealedPayout::from_wallet_seed(b"independent-dev-wallet", self.height());
-        self.mine_pow_with_payout(ticket, &pay, extra)
+    pub fn mine_pow_with_bundles(&mut self, wallet_seed: &str, extra: Vec<ActionBundle>) -> Block {
+        let pay = SealedPayout::from_wallet_seed(wallet_seed.as_bytes(), self.height());
+        self.mine_pow_with_payout("local", &pay, extra)
     }
 
     pub fn mint_pos_block(&mut self, payout: &SealedPayout, proof: &StakeProof) -> Result<Block, &'static str> {
@@ -308,14 +311,14 @@ mod tests {
     #[test]
     fn compact_only_pow() {
         let mut chain = Blockchain::new();
-        let block = chain.mine_pow_block("pool-ticket");
+        let block = chain.mine_pow_block("local-miner");
         assert!(block.compact.len() >= 1);
         assert_eq!(block.header.notes_root, chain.launch.commitment());
     }
 
     #[test]
     fn ticket_is_not_payout_seed() {
-        let a = SealedPayout::from_wallet_seed(b"independent-dev-wallet", 1);
+        let a = SealedPayout::from_wallet_seed(b"local-miner", 1);
         let b = SealedPayout::from_wallet_seed(b"pool-ticket", 1);
         assert_ne!(a.dest.bytes, b.dest.bytes);
     }
@@ -349,14 +352,15 @@ mod tests {
         .expect("owned spend");
         let encoded = format!("{:?}", bundle.real_spends()[0].proof);
         assert!(!encoded.contains("dest"));
-        let _ = chain.mine_pow_with_bundles("pool-ticket", vec![bundle.clone()]);
+        assert!(!encoded.contains("ring:"));
+        let _ = chain.mine_pow_with_payout("pool-ticket", &pay, vec![bundle.clone()]);
         assert!(chain.apply_transfer(&bundle).is_err());
     }
 
     #[test]
     fn pos_takes_stake_proof() {
         let mut chain = Blockchain::new();
-        let _ = chain.mine_pow_block("t");
+        let _ = chain.mine_pow_block("staker-local");
         let r = blinding_from_seed(b"stk");
         let coins = CHAIN_PARAMS.min_stake;
         let c = ValueCommitment::commit(coins, &r, &PedersenGenerators::default());
