@@ -9,45 +9,44 @@ use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProfileKind {
-    Constrained,
-    Sparse,
-    Standard,
-    Dense,
+    Constrained, Sparse, Standard, Dense,
 }
 
 impl ProfileKind {
     pub fn cap(self) -> usize {
         match self {
-            Self::Constrained => 64,
-            Self::Sparse => 256,
-            Self::Standard => 1024,
-            Self::Dense => 4096,
+            Self::Constrained => 64, Self::Sparse => 256, Self::Standard => 1024, Self::Dense => 4096,
         }
     }
     pub fn window_epochs(self) -> usize {
         match self {
-            Self::Constrained => 4,
-            Self::Sparse => 8,
-            Self::Standard => 16,
-            Self::Dense => 32,
+            Self::Constrained => 4, Self::Sparse => 8, Self::Standard => 16, Self::Dense => 32,
         }
     }
     pub fn bucket(self) -> usize { self.cap() }
     pub fn id(self) -> u8 {
-        match self {
-            Self::Constrained => 1,
-            Self::Sparse => 2,
-            Self::Standard => 3,
-            Self::Dense => 4,
-        }
+        match self { Self::Constrained => 1, Self::Sparse => 2, Self::Standard => 3, Self::Dense => 4 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveNote {
+    pub cm: [u8; 32],
+    pub pred: [u8; 32],
+    pub pred_commit: [u8; 32],
+}
+
+impl LiveNote {
+    pub fn plain(cm: [u8; 32]) -> Self {
+        Self { cm, pred: [0u8; 32], pred_commit: [0u8; 32] }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaunchSet {
     pub profile: ProfileKind,
-    live: Vec<[u8; 32]>,
-    window: VecDeque<Vec<[u8; 32]>>,
+    live: Vec<LiveNote>,
+    window: VecDeque<Vec<LiveNote>>,
     forest_acc: [u8; 32],
     sealed_count: u64,
 }
@@ -59,14 +58,21 @@ impl LaunchSet {
     pub fn standard() -> Self { Self::new(ProfileKind::Standard) }
     pub fn live_leaves(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
+        for epoch in &self.window { out.extend(epoch.iter().map(|n| n.cm)); }
+        out.extend(self.live.iter().map(|n| n.cm));
+        out
+    }
+    fn sorted(&self) -> Vec<[u8; 32]> {
+        let mut l = self.live_leaves(); l.sort_unstable(); l
+    }
+    pub fn live_notes(&self) -> Vec<LiveNote> {
+        let mut out = Vec::new();
         for epoch in &self.window { out.extend_from_slice(epoch); }
         out.extend_from_slice(&self.live);
         out
     }
-    fn sorted(&self) -> Vec<[u8; 32]> {
-        let mut l = self.live_leaves();
-        l.sort_unstable();
-        l
+    pub fn live_leaves_for(&self, pred: [u8; 32], pred_commit: [u8; 32]) -> Vec<[u8; 32]> {
+        self.live_notes().into_iter().filter(|n| n.pred == pred && n.pred_commit == pred_commit).map(|n| n.cm).collect()
     }
     pub fn window_root(&self) -> [u8; 32] { merkle_root(&self.sorted()) }
     pub fn commitment(&self) -> [u8; 32] {
@@ -79,14 +85,16 @@ impl LaunchSet {
     pub fn contains(&self, leaf: [u8; 32]) -> bool {
         self.live_leaves().iter().any(|l| *l == leaf)
     }
-    pub fn append(&mut self, leaf: [u8; 32]) {
-        self.live.push(leaf);
+    pub fn append(&mut self, leaf: [u8; 32]) { self.append_note(LiveNote::plain(leaf)); }
+    pub fn append_note(&mut self, note: LiveNote) {
+        self.live.push(note);
         if self.live.len() >= self.profile.cap() { self.seal(); }
     }
     pub fn seal(&mut self) {
         if self.live.is_empty() { return; }
         self.pad_live();
-        let epoch_root = merkle_root(&self.live);
+        let cms: Vec<[u8; 32]> = self.live.iter().map(|n| n.cm).collect();
+        let epoch_root = merkle_root(&cms);
         let mut acc = Vec::with_capacity(64);
         acc.extend_from_slice(&self.forest_acc);
         acc.extend_from_slice(&epoch_root);
@@ -99,7 +107,7 @@ impl LaunchSet {
         let bucket = self.profile.bucket();
         let mut i = self.live.len() as u64;
         while self.live.len() < bucket {
-            self.live.push(pad_point(&self.forest_acc, self.sealed_count, i));
+            self.live.push(LiveNote::plain(pad_point(&self.forest_acc, self.sealed_count, i)));
             i += 1;
         }
     }
