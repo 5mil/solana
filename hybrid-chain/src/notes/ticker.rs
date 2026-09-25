@@ -1,7 +1,7 @@
 //! ORTH is the native ticker. Issued tickers are notes with a public asset id.
 
 use super::action::{ActionBundle, CompactAction, CompactOutput};
-use super::asset::{ticker_id, ORTH};
+use super::asset::{normalize_symbol, ticker_id, ORTH};
 use super::commitment::{blinding_from_seed, ValueCommitment};
 use super::intent::{Intent, IntentFill};
 use super::keys::{SpendKey, SpendPk};
@@ -56,7 +56,7 @@ fn eph(label: &[u8], div: &[u8; 16], pk: &[u8; 32]) -> [u8; 32] {
     (sk * RISTRETTO_BASEPOINT_POINT).compress().to_bytes()
 }
 
-fn note(dest: SpendPk, value: u64, blind: &Scalar, asset: [u8; 32], pred: PredHeader, div: [u8; 16]) -> CompactOutput {
+fn note(dest: SpendPk, value: u64, blind: &Scalar, asset: [u8; 32], symbol: String, pred: PredHeader, div: [u8; 16]) -> CompactOutput {
     CompactOutput {
         dest: dest.clone(),
         eph_pk: eph(b"eph-t", &div, &dest.bytes),
@@ -64,6 +64,7 @@ fn note(dest: SpendPk, value: u64, blind: &Scalar, asset: [u8; 32], pred: PredHe
         value_commitment: commit_with_asset(value, blind, &ORTH),
         pred,
         asset,
+        symbol,
     }
 }
 
@@ -72,18 +73,20 @@ pub fn birth_outputs(
     graduate_quote: u64, start_height: u64, team_value: u64, team_unlock: u64, height: u64,
 ) -> Result<(ActionBundle, CurveSpec, [u8; 32]), &'static str> {
     let _ = height;
-    let asset = ticker_id(symbol, &creator.pk(), salt);
+    let _ = salt;
+    let sym = normalize_symbol(symbol)?.to_string();
+    let asset = ticker_id(&sym)?;
     if cap == 0 || virtual_quote == 0 { return Err("cap/virtual"); }
     let spec = CurveSpec::new(asset, cap, virtual_quote, graduate_quote, start_height);
     let inv_r = blinding_from_seed(&[b"inv-r".as_ref(), &asset, &cap.to_le_bytes()].concat());
-    let inv = note(creator.pk(), cap, &inv_r, asset, PredHeader::from_pred(&spec.as_pred()), [1u8; 16]);
+    let inv = note(creator.pk(), cap, &inv_r, asset, sym.clone(), PredHeader::from_pred(&spec.as_pred()), [1u8; 16]);
     let mut actions = vec![CompactAction { spend: None, output: Some(inv) }];
     if team_value > 0 {
         if team_value >= cap { return Err("team >= cap"); }
         let team_pred = Predicate::After { height: team_unlock };
         let team_r = blinding_from_seed(&[b"team-r".as_ref(), &asset].concat());
         actions.push(CompactAction { spend: None, output: Some(note(
-            creator.pk(), team_value, &team_r, asset, PredHeader::from_pred(&team_pred), [2u8; 16],
+            creator.pk(), team_value, &team_r, asset, sym.clone(), PredHeader::from_pred(&team_pred), [2u8; 16],
         )) });
     }
     let intent = Intent { id: asset, want_asset: asset, pay_asset: ORTH, expire_height: u64::MAX, bound: spec.as_pred().commit() };
@@ -115,6 +118,15 @@ mod tests {
         let (b, spec, id) = birth_outputs(&sk, "MEME", b"salt", 1_000_000, 10_000, 80_000, 1, 0, 0, 1).unwrap();
         assert_eq!(spec.asset, id);
         assert_eq!(b.real_outputs()[0].asset, id);
+        assert_eq!(b.real_outputs()[0].symbol, "MEME");
         assert_ne!(id, ORTH);
+    }
+    #[test]
+    fn same_name_same_asset() {
+        let a = SpendKey::from_wallet_seed(b"a");
+        let b = SpendKey::from_wallet_seed(b"b");
+        let (_, _, id_a) = birth_outputs(&a, "MEME", b"s1", 1000, 10, 50, 1, 0, 0, 1).unwrap();
+        let (_, _, id_b) = birth_outputs(&b, "MEME", b"s2", 1000, 10, 50, 1, 0, 0, 1).unwrap();
+        assert_eq!(id_a, id_b);
     }
 }
