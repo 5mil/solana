@@ -1,5 +1,5 @@
-//! Native ORTH and first-seen ticker ids.
-//! Asset id is public. Amount stays in the commitment.
+//! Native ORTH and a first-seen symbol book.
+//! A ticker name is taken forever. Asset id is the hash of the symbol.
 
 use crate::consensus::pow::sha256d;
 use super::keys::SpendPk;
@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 
 pub const ORTH: [u8; 32] = [0u8; 32];
 
-pub fn ticker_id(symbol: &str, creator: &SpendPk, salt: &[u8]) -> [u8; 32] {
-    let sym = normalize_symbol(symbol).unwrap_or("");
-    sha256d(&[b"orthal-ticker".as_ref(), sym.as_bytes(), &creator.bytes, salt].concat())
+/// Asset id is only the symbol. Salt and creator cannot mint a second MEME.
+pub fn ticker_id(symbol: &str) -> Result<[u8; 32], &'static str> {
+    let sym = normalize_symbol(symbol)?;
+    Ok(sha256d(&[b"orthal-ticker".as_ref(), sym.as_bytes()].concat()))
 }
 
 pub fn normalize_symbol(symbol: &str) -> Result<&str, &'static str> {
@@ -39,16 +40,25 @@ pub struct AssetBook {
 
 impl AssetBook {
     pub fn new() -> Self { Self::default() }
-    pub fn get(&self, asset: &[u8; 32]) -> Option<&TickerRecord> {
-        if *asset == ORTH { return None; }
-        self.by_id.get(asset)
+    pub fn get(&self, asset: &[u8; 32]) -> Option<&TickerRecord> { self.by_id.get(asset) }
+    pub fn by_symbol(&self, symbol: &str) -> Option<&TickerRecord> {
+        let id = self.by_symbol.get(symbol)?;
+        self.by_id.get(id)
     }
     pub fn is_orth(asset: &[u8; 32]) -> bool { *asset == ORTH }
+    pub fn symbol_taken(&self, symbol: &str) -> bool {
+        symbol == "ORTH" || self.by_symbol.contains_key(symbol)
+    }
     pub fn register(&mut self, rec: TickerRecord) -> Result<(), &'static str> {
+        let sym = normalize_symbol(&rec.symbol)?.to_string();
         if rec.asset == ORTH { return Err("ORTH is not issued"); }
+        let expect = ticker_id(&sym)?;
+        if rec.asset != expect { return Err("asset id must be hash(symbol)"); }
         if self.by_id.contains_key(&rec.asset) { return Err("ticker id taken"); }
-        if self.by_symbol.contains_key(&rec.symbol) { return Err("symbol taken"); }
-        self.by_symbol.insert(rec.symbol.clone(), rec.asset);
+        if self.by_symbol.contains_key(&sym) { return Err("symbol taken"); }
+        let mut rec = rec;
+        rec.symbol = sym.clone();
+        self.by_symbol.insert(sym, rec.asset);
         self.by_id.insert(rec.asset, rec);
         Ok(())
     }
@@ -62,20 +72,29 @@ mod tests {
     #[test]
     fn orth_reserved() {
         assert!(AssetBook::is_orth(&ORTH));
-        let pk = SpendKey::from_wallet_seed(b"c").pk();
         assert!(normalize_symbol("ORTH").is_err());
-        assert_ne!(ticker_id("DOGE", &pk, b"1"), ticker_id("DOGE", &pk, b"2"));
+        assert!(ticker_id("ORTH").is_err());
     }
     #[test]
-    fn first_seen_wins() {
+    fn same_symbol_same_id() {
+        assert_eq!(ticker_id("MEME").unwrap(), ticker_id("MEME").unwrap());
+        assert_ne!(ticker_id("MEME").unwrap(), ticker_id("PEPE").unwrap());
+    }
+    #[test]
+    fn symbol_cannot_be_reissued() {
         let mut book = AssetBook::new();
         let pk = SpendKey::from_wallet_seed(b"c").pk();
-        let id = ticker_id("MEME", &pk, b"s");
+        let id = ticker_id("MEME").unwrap();
         let rec = TickerRecord { asset: id, symbol: "MEME".into(), creator: pk.clone(), height: 1 };
         assert!(book.register(rec.clone()).is_ok());
-        assert!(book.register(rec).is_err());
-        let other = ticker_id("MEME", &SpendKey::from_wallet_seed(b"x").pk(), b"s");
-        let rec2 = TickerRecord { asset: other, symbol: "MEME".into(), creator: pk, height: 2 };
-        assert!(book.register(rec2).is_err());
+        assert!(book.symbol_taken("MEME"));
+        assert_eq!(book.register(rec).unwrap_err(), "ticker id taken");
+    }
+    #[test]
+    fn forged_id_rejected() {
+        let mut book = AssetBook::new();
+        let pk = SpendKey::from_wallet_seed(b"c").pk();
+        let rec = TickerRecord { asset: [9u8; 32], symbol: "MEME".into(), creator: pk, height: 1 };
+        assert_eq!(book.register(rec).unwrap_err(), "asset id must be hash(symbol)");
     }
 }
