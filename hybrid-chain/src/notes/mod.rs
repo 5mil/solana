@@ -8,6 +8,7 @@ pub mod epoch;
 pub mod intent;
 pub mod keys;
 pub mod launch;
+pub mod market;
 pub mod membership;
 pub mod payout;
 pub mod pred;
